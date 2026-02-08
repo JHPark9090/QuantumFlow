@@ -1,29 +1,31 @@
 """
-Modular QTS-QFM for Spatio-Temporal Classification
-====================================================
+Modular QTS-NLP: QSVT + ANO for GLUE Benchmarks
+==================================================
 
-Combines:
-  - QTSTransformer's QSVT via LCU (hardware-compatible block encoding)
-  - ModularQFM's Adaptive Non-Local Observables (ANO, Chen et al., 2025)
+Discriminative NLP classifier combining:
+  - QTSTransformer_v2's positional encoding + temporal chunking
+  - ModularQTS's QSVT via LCU (PREPARE-SELECT-PREPARE†) + ANO measurement
 
 Architecture:
-  Input (batch, C, T) -> permute -> (batch, T, C)
-    -> + Sinusoidal PE (Vaswani et al., 2017)
-    -> Linear(C, n_rots) + Sigmoid * 2pi -> [0, 2pi]
-    -> Single QNode:
-        PCPhase(phi_0)
-        for k in range(degree):
-            PREPARE (learnable V on ancilla)
-            SELECT([U_0(x_0), ..., U_T(x_T)])
-            PREPARE_dag
-            PCPhase(phi_{k+1})
-        QFF sim14 on main register
-        -> ANO: learnable k-local Hermitian observables on main register
-    -> Linear(n_obs, output_dim) -> class logits
+  GLUE batch: {input_ids: (B,L), attention_mask: (B,L)}
+    -> nn.Embedding(vocab_size, embed_dim) -> (B, L, embed_dim)
+    -> + Sinusoidal PE -> (B, L, embed_dim)
+    -> mask padding tokens to zero
+    -> Linear(embed_dim, n_rots) + Sigmoid -> (B, L, n_rots)
+    -> Chunk into windows of chunk_size
+    -> Each chunk: QSVT via LCU (PREPARE-SELECT-PREPARE†) + QFF -> ANO
+    -> Mean pool across chunks -> (B, n_obs)
+    -> Linear(n_obs, output_dim) -> logits
 
 Usage:
-  python ModularQTS.py --dataset=physionet --n-qubits=6 --degree=2 \
-      --n-layers=2 --k-local=2 --n-epochs=50 --batch-size=32
+  python ModularQTS_NLP.py --task=sst2 --n-qubits=6 --degree=2 \
+      --n-layers=2 --k-local=2 --embed-dim=64 --chunk-size=32 \
+      --max-length=128 --n-epochs=50 --batch-size=32
+
+References:
+  - Sim et al. (2019). Expressibility and Entangling Capability of PQCs.
+  - Chen et al. (2025). Learning to Measure QNNs. ICASSP 2025.
+  - Lin et al. (2025). Adaptive Non-local Observable on QNNs. IEEE QCE 2025.
 """
 
 import argparse
@@ -31,9 +33,9 @@ import os
 import sys
 import random
 import copy
+import math
 import time
 import csv
-import math
 from math import ceil, log2
 from itertools import combinations
 
@@ -44,7 +46,6 @@ from tqdm import tqdm
 import scipy.constants  # noqa: F401 -- pre-import for PennyLane/scipy compat
 import pennylane as qml
 
-# Import data loaders from data/ subdirectory
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 
@@ -52,7 +53,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 # 1. Argparse
 # ---------------------------------------------------------------------------
 def get_args():
-    p = argparse.ArgumentParser(description="Modular QTS-QFM: QSVT + ANO")
+    p = argparse.ArgumentParser(description="Modular QTS-NLP: QSVT + ANO for GLUE")
 
     # Model
     p.add_argument("--n-qubits", type=int, default=6)
@@ -68,6 +69,19 @@ def get_args():
     p.add_argument("--obs-scheme", type=str, default="sliding",
                    choices=["sliding", "pairwise"])
 
+    # NLP-specific
+    p.add_argument("--task", type=str, default="sst2",
+                   choices=["cola", "sst2", "mrpc", "qqp", "stsb",
+                            "mnli", "qnli", "rte", "wnli"])
+    p.add_argument("--max-length", type=int, default=128,
+                   help="Max token sequence length")
+    p.add_argument("--embed-dim", type=int, default=64,
+                   help="Embedding dimension")
+    p.add_argument("--chunk-size", type=int, default=32,
+                   help="Temporal chunk size for QSVT")
+    p.add_argument("--vocab-size", type=int, default=30522,
+                   help="Vocabulary size (30522 for bert-base-uncased)")
+
     # Training
     p.add_argument("--n-epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=32)
@@ -75,24 +89,17 @@ def get_args():
                    help="LR for circuit/head params")
     p.add_argument("--lr-H", type=float, default=1e-1,
                    help="LR for observable (ANO) params (Chen 2025: 100x)")
-    p.add_argument("--wd", type=float, default=0.0,
-                   help="Weight decay")
+    p.add_argument("--wd", type=float, default=0.0)
     p.add_argument("--patience", type=int, default=20,
                    help="Early stopping patience (0 = disabled)")
 
-    # Data
-    p.add_argument("--dataset", type=str, default="physionet",
-                   help="Dataset to use (physionet or custom)")
-    p.add_argument("--num-classes", type=int, default=2,
-                   help="Number of classes (determines output_dim and loss)")
-    p.add_argument("--sampling-freq", type=int, default=32,
-                   help="PhysioNet: target sampling frequency")
-    p.add_argument("--sample-size", type=int, default=50,
-                   help="PhysioNet: number of subjects")
+    # Debug / data limits
+    p.add_argument("--max-train-samples", type=int, default=None)
+    p.add_argument("--max-val-samples", type=int, default=None)
 
     # I/O
     p.add_argument("--seed", type=int, default=2025)
-    p.add_argument("--job-id", type=str, default="mqts_001")
+    p.add_argument("--job-id", type=str, default="mqts_nlp_001")
     p.add_argument("--base-path", type=str, default=".")
     p.add_argument("--resume", action="store_true", default=False)
 
@@ -137,15 +144,8 @@ def get_wire_groups(n_qubits, k_local, obs_scheme):
     raise ValueError(f"Unknown obs_scheme: {obs_scheme}")
 
 
-# ---------------------------------------------------------------------------
-# 3. sim14 circuit (Sim et al., 2019)
-# ---------------------------------------------------------------------------
 def sim14_circuit(params, wires, layers=1):
-    """
-    sim14 ansatz: RY -> CRX(ring) -> RY -> CRX(counter-ring).
-    Supports both batched (2D) and unbatched (1D) parameter tensors.
-    Parameters per layer: 4 * wires.
-    """
+    """sim14 ansatz: RY -> CRX(ring) -> RY -> CRX(counter-ring)."""
     is_batched = params.ndim == 2
     param_idx = 0
     for _ in range(layers):
@@ -169,38 +169,57 @@ def sim14_circuit(params, wires, layers=1):
 
 
 # ---------------------------------------------------------------------------
-# 4. ModularQTS Model
+# 3. ModularQTS_NLP Model
 # ---------------------------------------------------------------------------
-class ModularQTS(nn.Module):
+class ModularQTS_NLP(nn.Module):
     """
-    Modular QTS: QSVT via LCU + Adaptive Non-Local Observables.
+    Modular QTS for NLP: QSVT via LCU + ANO with token embeddings.
 
-    Combines QTSTransformer's hardware-compatible QSVT pipeline with
-    ModularQFM's learnable k-local Hermitian measurement.
+    Combines QTSTransformer_v2's PE + chunking with ModularQTS's QSVT + ANO
+    pipeline, replacing EEG inputs with token embeddings for GLUE tasks.
     """
 
     def __init__(self,
                  n_qubits: int,
-                 n_timesteps: int,
+                 embed_dim: int,
+                 max_length: int,
                  degree: int,
                  n_ansatz_layers: int,
-                 feature_dim: int,
                  output_dim: int,
                  dropout: float,
                  k_local: int,
                  obs_scheme: str,
+                 vocab_size: int,
+                 chunk_size: int,
                  device):
         super().__init__()
 
         self.n_qubits = n_qubits
-        self.n_timesteps = n_timesteps
+        self.max_length = max_length
         self.degree = degree
         self.n_ansatz_layers = n_ansatz_layers
         self.k_local = k_local
         self.device = device
 
-        # -- Qubit registers --
-        self.n_ancilla = ceil(log2(max(n_timesteps, 2)))
+        # -- Token embedding --
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+
+        # -- Sinusoidal Positional Encoding (Vaswani et al., 2017) --
+        pe = torch.zeros(max_length, embed_dim)
+        pos = torch.arange(max_length).unsqueeze(1).float()
+        div = torch.exp(
+            torch.arange(0, embed_dim, 2).float()
+            * -(math.log(10000.0) / embed_dim))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div[:embed_dim // 2])
+        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_length, embed_dim)
+
+        # -- Temporal chunking --
+        self.chunk_size = chunk_size or max_length
+        self.n_chunks = ceil(max_length / self.chunk_size)
+
+        # -- Qubit registers (sized by chunk) --
+        self.n_ancilla = ceil(log2(max(self.chunk_size, 2)))
         self.main_wires = list(range(n_qubits))
         self.anc_wires = list(range(n_qubits, n_qubits + self.n_ancilla))
         self.total_wires = n_qubits + self.n_ancilla
@@ -211,30 +230,16 @@ class ModularQTS(nn.Module):
         self.qff_n_rots = 4 * n_qubits * 1  # single QFF layer
 
         # -- Classical layers --
-        self.feature_projection = nn.Linear(feature_dim, self.n_rots)
+        self.feature_projection = nn.Linear(embed_dim, self.n_rots)
         self.dropout = nn.Dropout(dropout)
         self.rot_sigm = nn.Sigmoid()
 
-        # -- Sinusoidal Positional Encoding (Vaswani et al., 2017) --
-        pe = torch.zeros(n_timesteps, feature_dim)
-        pos = torch.arange(n_timesteps).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0, feature_dim, 2).float()
-                        * -(math.log(10000.0) / feature_dim))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div[:feature_dim // 2])
-        self.register_buffer('pe', pe.unsqueeze(0))  # (1, T, feature_dim)
-
         # -- Trainable quantum parameters --
-        # PREPARE ansatz on ancilla
         self.n_prep_layers = self.n_ancilla
         self.prepare_params = nn.Parameter(
             0.1 * torch.randn(self.n_prep_layers, self.n_ancilla, 2))
-
-        # QSVT signal processing angles
         self.signal_angles = nn.Parameter(
             0.1 * torch.randn(degree + 1))
-
-        # QFF parameters (single sim14 layer on main register)
         self.qff_params = nn.Parameter(torch.rand(self.qff_n_rots))
 
         # -- ANO parameters (Chen et al., 2025) --
@@ -266,7 +271,7 @@ class ModularQTS(nn.Module):
 
         # Capture instance attributes for QNode closure
         _n_qubits = n_qubits
-        _n_timesteps = n_timesteps
+        _chunk_size = self.chunk_size
         _n_ancilla = self.n_ancilla
         _n_ansatz_layers = n_ansatz_layers
         _n_prep_layers = self.n_prep_layers
@@ -283,10 +288,10 @@ class ModularQTS(nn.Module):
         @qml.qnode(self.dev, interface="torch", diff_method="backprop")
         def _circuit(ts_params, prep_p, sig_ang, qff_p, H_mats):
             """
-            QSVT via LCU + ANO measurement.
+            QSVT via LCU + ANO measurement on a single chunk.
 
             Args:
-                ts_params: (B, T, n_rots) -- data-dependent sim14 params
+                ts_params: (B, chunk_size, n_rots) -- rotation params for chunk
                 prep_p:    (n_prep_layers, n_ancilla, 2) -- PREPARE params
                 sig_ang:   (degree+1,) -- signal processing angles
                 qff_p:     (qff_n_rots,) -- QFF circuit params
@@ -294,7 +299,6 @@ class ModularQTS(nn.Module):
             """
 
             def prepare():
-                """Learnable PREPARE unitary V on ancilla register."""
                 for ly in range(_n_prep_layers):
                     for qi, q in enumerate(_anc_wires):
                         qml.RY(prep_p[ly, qi, 0], wires=q)
@@ -303,32 +307,27 @@ class ModularQTS(nn.Module):
                         qml.CNOT(wires=[_anc_wires[i], _anc_wires[i + 1]])
 
             def build_select_ops():
-                """Build sim14 unitaries for qml.Select, padded to 2^n_ancilla."""
                 select_ops = []
-                for t in range(_n_timesteps):
+                for t in range(_chunk_size):
                     gates = []
                     param_idx = 0
                     for _ in range(_n_ansatz_layers):
-                        # RY layer
                         for i in range(_n_qubits):
                             gates.append(qml.RY(
                                 ts_params[..., t, param_idx],
                                 wires=_main_wires[i]))
                             param_idx += 1
-                        # CRX ring (reverse order)
                         for i in range(_n_qubits - 1, -1, -1):
                             gates.append(qml.CRX(
                                 ts_params[..., t, param_idx],
                                 wires=[_main_wires[i],
                                        _main_wires[(i + 1) % _n_qubits]]))
                             param_idx += 1
-                        # RY layer
                         for i in range(_n_qubits):
                             gates.append(qml.RY(
                                 ts_params[..., t, param_idx],
                                 wires=_main_wires[i]))
                             param_idx += 1
-                        # CRX counter-ring
                         wire_order = [_n_qubits - 1] + list(range(_n_qubits - 1))
                         for i in wire_order:
                             gates.append(qml.CRX(
@@ -337,12 +336,11 @@ class ModularQTS(nn.Module):
                                        _main_wires[(i - 1) % _n_qubits]]))
                             param_idx += 1
                     select_ops.append(qml.prod(*reversed(gates)))
-                # Pad to 2^n_ancilla with Identity
                 while len(select_ops) < _n_select_ops:
                     select_ops.append(qml.Identity(wires=_main_wires[0]))
                 return select_ops
 
-            # -- QSVT: alternating signal processing and LCU block encoding --
+            # QSVT: alternating signal processing and LCU block encoding
             select_ops = build_select_ops()  # build once, reuse
 
             qml.PCPhase(sig_ang[0], dim=_pcphase_dim, wires=_pcphase_wires)
@@ -357,10 +355,10 @@ class ModularQTS(nn.Module):
                 qml.PCPhase(sig_ang[k + 1], dim=_pcphase_dim,
                             wires=_pcphase_wires)
 
-            # -- QFF on main register --
+            # QFF on main register
             sim14_circuit(qff_p, wires=_n_qubits, layers=1)
 
-            # -- Measurement: ANO or fixed PauliZ --
+            # Measurement: ANO or fixed PauliZ
             if _kl > 0:
                 return [qml.expval(qml.Hermitian(H_mats[w], wires=_wg[w]))
                         for w in range(_no)]
@@ -375,22 +373,45 @@ class ModularQTS(nn.Module):
         return [create_Hermitian(self.obs_dim, self.A[w], self.B[w], self.D[w])
                 for w in range(self.n_obs)]
 
-    def forward(self, x):
-        # x: (batch, n_channels, n_timesteps)
-        x = x.permute(0, 2, 1)                           # (batch, T, C)
-        x = x + self.pe[:, :x.size(1)]                   # positional encoding
-        x = self.feature_projection(self.dropout(x))      # (batch, T, n_rots)
-        ts_params = self.rot_sigm(x) * (2 * math.pi)     # sigmoid -> [0, 2pi]
+    def forward(self, input_ids, attention_mask):
+        """
+        Args:
+            input_ids:      (B, L) int token IDs
+            attention_mask: (B, L) binary mask (1=real, 0=pad)
+        Returns:
+            logits: (B, output_dim)
+        """
+        B, L = input_ids.shape
 
+        # Embed + PE + mask
+        x = self.embedding(input_ids)                      # (B, L, embed_dim)
+        x = x + self.pe[:, :L]                             # + sinusoidal PE
+        x = x * attention_mask.unsqueeze(-1).float()       # zero out padding
+
+        # Project to rotation params
+        x = self.feature_projection(self.dropout(x))       # (B, L, n_rots)
+        ts_params = self.rot_sigm(x) * (2 * math.pi)        # sigmoid -> [0, 2pi]
+
+        # Build Hermitian matrices for ANO
         H_mats = self._build_H_matrices()
-        exps = self._circuit(
-            ts_params, self.prepare_params,
-            self.signal_angles, self.qff_params, H_mats)
-        exps = torch.stack(exps, dim=1).float()           # (batch, n_obs)
-        return self.head(exps)                             # (batch, output_dim)
+
+        # Process chunks (from QTSTransformer_v2)
+        chunk_results = []
+        for start in range(0, L, self.chunk_size):
+            chunk = ts_params[:, start:start + self.chunk_size]
+            pad_len = self.chunk_size - chunk.size(1)
+            if pad_len > 0:
+                chunk = nn.functional.pad(chunk, (0, 0, 0, pad_len))
+            exps = self._circuit(
+                chunk, self.prepare_params,
+                self.signal_angles, self.qff_params, H_mats)
+            chunk_results.append(torch.stack(exps, dim=1).float())
+
+        # Mean pool across chunks -> (B, n_obs)
+        exps = torch.stack(chunk_results, dim=0).mean(dim=0)
+        return self.head(exps)                              # (B, output_dim)
 
     def get_eigenvalue_range(self):
-        """Diagnostic: eigenvalue range of learned observables."""
         if self.k_local <= 0:
             return 0.0, 0.0
         H_mats = self._build_H_matrices()
@@ -404,7 +425,31 @@ class ModularQTS(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 5. Main -- Data, Training, Evaluation
+# 4. Metrics
+# ---------------------------------------------------------------------------
+def compute_metric(metric_name, preds, labels, probs=None):
+    """Compute GLUE task-specific metric."""
+    if metric_name == "accuracy":
+        return (np.array(preds) == np.array(labels)).mean()
+
+    elif metric_name == "f1":
+        from sklearn.metrics import f1_score
+        return f1_score(labels, preds, average="binary")
+
+    elif metric_name == "matthews_correlation":
+        from sklearn.metrics import matthews_corrcoef
+        return matthews_corrcoef(labels, preds)
+
+    elif metric_name == "pearson":
+        from scipy.stats import pearsonr
+        r, _ = pearsonr(preds, labels)
+        return r
+
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# 5. Main
 # ---------------------------------------------------------------------------
 def main():
     args = get_args()
@@ -413,59 +458,70 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"PennyLane {qml.__version__}  |  PyTorch {torch.__version__}  |  {device}")
 
-    # -- Data --
-    # Dataset loader registry: each returns (train, val, test, input_dim)
-    # input_dim = (n_trials, n_channels, n_timesteps)
-    DATASET_LOADERS = {}
+    # -- Load GLUE data --
+    from data.Load_GLUE import load_glue_task, GLUE_TASKS
 
-    # PhysioNet EEG Motor Imagery
-    def load_physionet():
-        from data.Load_PhysioNet_EEG import load_eeg_ts_revised
-        return load_eeg_ts_revised(
-            seed=args.seed, device=device, batch_size=args.batch_size,
-            sampling_freq=args.sampling_freq, sample_size=args.sample_size)
+    task_config = GLUE_TASKS[args.task]
+    is_regression = task_config.get("is_regression", False)
+    metric_name = task_config["metric"]
 
-    DATASET_LOADERS["physionet"] = load_physionet
+    train_loader, val_loader, test_loader, metadata = load_glue_task(
+        task_name=args.task,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        num_workers=0,
+        max_train_samples=args.max_train_samples,
+        max_val_samples=args.max_val_samples,
+    )
 
-    if args.dataset not in DATASET_LOADERS:
-        raise ValueError(f"Unknown dataset: {args.dataset}. "
-                         f"Available: {list(DATASET_LOADERS.keys())}")
+    vocab_size = metadata["vocab_size"]
+    if args.vocab_size != vocab_size:
+        print(f"Note: using tokenizer vocab_size={vocab_size} "
+              f"(CLI was {args.vocab_size})")
 
-    train_loader, val_loader, test_loader, input_dim = DATASET_LOADERS[args.dataset]()
-    n_trials, n_channels, n_timesteps = input_dim[0], input_dim[1], input_dim[2]
-    print(f"Dataset: {args.dataset}  |  input_dim={input_dim}")
-    print(f"  n_channels={n_channels}  n_timesteps={n_timesteps}")
+    print(f"Task: {args.task} ({task_config['name']})  |  "
+          f"metric: {metric_name}")
+    print(f"  num_labels={metadata['num_labels']}  "
+          f"is_regression={is_regression}")
+    print(f"  train={metadata['train_size']}  val={metadata['val_size']}")
 
     # -- Output dim --
-    if args.num_classes <= 2:
+    num_labels = metadata["num_labels"]
+    if is_regression:
+        output_dim = 1
+    elif num_labels <= 2:
         output_dim = 1   # binary: BCEWithLogitsLoss
     else:
-        output_dim = args.num_classes  # multi-class: CrossEntropyLoss
+        output_dim = num_labels  # multi-class: CrossEntropyLoss
 
     # -- Model --
-    model = ModularQTS(
+    model = ModularQTS_NLP(
         n_qubits=args.n_qubits,
-        n_timesteps=n_timesteps,
+        embed_dim=args.embed_dim,
+        max_length=args.max_length,
         degree=args.degree,
         n_ansatz_layers=args.n_layers,
-        feature_dim=n_channels,
         output_dim=output_dim,
         dropout=args.dropout,
         k_local=args.k_local,
         obs_scheme=args.obs_scheme,
+        vocab_size=vocab_size,
+        chunk_size=args.chunk_size,
         device=device,
     ).to(device)
 
-    print(f"Model: ModularQTS")
+    print(f"Model: ModularQTS_NLP")
     print(f"  qubits={args.n_qubits}  ancilla={model.n_ancilla}  "
           f"total_wires={model.total_wires}")
     print(f"  degree={args.degree}  layers={args.n_layers}  "
           f"n_rots={model.n_rots}")
+    print(f"  chunk_size={model.chunk_size}  n_chunks(max)={model.n_chunks}")
     print(f"  ANO: k_local={args.k_local}  scheme={args.obs_scheme}  "
           f"n_obs={model.n_obs}")
-    print(f"  output_dim={output_dim}")
+    print(f"  embed_dim={args.embed_dim}  vocab_size={vocab_size}  "
+          f"output_dim={output_dim}")
 
-    # -- Separate optimizers (Chen 2025: 100x ratio) --
+    # -- Dual optimizer (Chen 2025) --
     H_params, circuit_params = [], []
     for name, param in model.named_parameters():
         if name.startswith(("A.", "B.", "D.")):
@@ -473,12 +529,15 @@ def main():
         else:
             circuit_params.append(param)
 
-    circuit_opt = torch.optim.Adam(circuit_params, lr=args.lr, weight_decay=args.wd)
+    circuit_opt = torch.optim.Adam(circuit_params, lr=args.lr,
+                                   weight_decay=args.wd)
     H_opt = (torch.optim.Adam(H_params, lr=args.lr_H, weight_decay=args.wd)
              if H_params else None)
 
-    # Loss: binary vs multi-class
-    if output_dim == 1:
+    # -- Loss --
+    if is_regression:
+        criterion = nn.MSELoss()
+    elif output_dim == 1:
         criterion = nn.BCEWithLogitsLoss()
     else:
         criterion = nn.CrossEntropyLoss()
@@ -493,13 +552,13 @@ def main():
     results_dir = os.path.join(args.base_path, "results")
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
-    ckpt_path = os.path.join(ckpt_dir, f"ckpt_mqts_{args.job_id}.pt")
-    csv_path = os.path.join(results_dir, f"log_mqts_{args.job_id}.csv")
-    csv_fields = ["epoch", "train_loss", "train_acc", "train_auc",
-                  "val_loss", "val_acc", "val_auc",
+    ckpt_path = os.path.join(ckpt_dir, f"ckpt_mqts_nlp_{args.job_id}.pt")
+    csv_path = os.path.join(results_dir, f"log_mqts_nlp_{args.job_id}.csv")
+    csv_fields = ["epoch", "train_loss", f"train_{metric_name}",
+                  "val_loss", f"val_{metric_name}",
                   "eig_min", "eig_max", "time_s"]
 
-    start_epoch, best_val_acc, best_state, best_epoch = 0, 0.0, None, 0
+    start_epoch, best_val_metric, best_state, best_epoch = 0, -1e9, None, 0
     history = []
 
     if args.resume and os.path.exists(ckpt_path):
@@ -509,7 +568,7 @@ def main():
         if H_opt and "H_opt" in ckpt:
             H_opt.load_state_dict(ckpt["H_opt"])
         start_epoch = ckpt["epoch"] + 1
-        best_val_acc = ckpt.get("best_val_acc", 0.0)
+        best_val_metric = ckpt.get("best_val_metric", -1e9)
         best_epoch = ckpt.get("best_epoch", 0)
         history = ckpt.get("history", [])
         print(f"Resumed from epoch {start_epoch}")
@@ -518,109 +577,93 @@ def main():
         with open(csv_path, "w", newline="") as f:
             csv.DictWriter(f, csv_fields).writeheader()
 
-    # -- AUC helper --
-    def compute_auc(all_probs, all_labels):
-        """Compute binary AUC. Returns 0.0 if single class or multi-class."""
-        if output_dim != 1:
-            return 0.0
-        try:
-            from sklearn.metrics import roc_auc_score
-            return roc_auc_score(all_labels, all_probs)
-        except Exception:
-            return 0.0
+    # -- Helpers --
+    def run_epoch(loader, training=True):
+        if training:
+            model.train()
+        else:
+            model.eval()
+
+        total_loss, total_n = 0.0, 0
+        all_preds, all_labels, all_probs = [], [], []
+
+        ctx = torch.no_grad() if not training else torch.enable_grad()
+        with ctx:
+            for batch in (tqdm(loader,
+                               desc=f"Epoch {epoch+1}/{args.n_epochs}",
+                               leave=False) if training else loader):
+                ids = batch["input_ids"].to(device)
+                mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+
+                if training:
+                    circuit_opt.zero_grad()
+                    if H_opt:
+                        H_opt.zero_grad()
+
+                logits = model(ids, mask)
+
+                if is_regression:
+                    logits = logits.squeeze(-1)
+                    loss = criterion(logits, labels.float())
+                    preds = logits.detach().cpu().numpy().tolist()
+                elif output_dim == 1:
+                    logits = logits.squeeze(-1)
+                    loss = criterion(logits, labels.float())
+                    preds = (logits > 0).long().cpu().numpy().tolist()
+                    probs = torch.sigmoid(logits).detach().cpu().numpy()
+                    all_probs.extend(probs.tolist())
+                else:
+                    loss = criterion(logits, labels.long())
+                    preds = logits.argmax(1).cpu().numpy().tolist()
+
+                if training:
+                    loss.backward()
+                    circuit_opt.step()
+                    if H_opt:
+                        H_opt.step()
+
+                bs = ids.size(0)
+                total_loss += loss.item() * bs
+                total_n += bs
+                all_preds.extend(preds)
+                all_labels.extend(labels.cpu().numpy().tolist())
+
+        avg_loss = total_loss / total_n
+        metric_val = compute_metric(
+            metric_name, all_preds, all_labels,
+            probs=all_probs if all_probs else None)
+        return avg_loss, metric_val
 
     # -- Training loop --
     no_improve = 0
     for epoch in range(start_epoch, args.n_epochs):
         t0 = time.time()
 
-        # Train
-        model.train()
-        tr_loss, tr_ok, tr_n = 0.0, 0, 0
-        tr_probs, tr_labels = [], []
-        for xb, yb in tqdm(train_loader,
-                           desc=f"Epoch {epoch+1}/{args.n_epochs}",
-                           leave=False):
-            xb, yb = xb.to(device), yb.to(device)
-            circuit_opt.zero_grad()
-            if H_opt:
-                H_opt.zero_grad()
-
-            logits = model(xb)
-
-            if output_dim == 1:
-                logits = logits.squeeze(-1)
-                loss = criterion(logits, yb.float())
-                preds = (logits > 0).long()
-                probs = torch.sigmoid(logits).detach().cpu().numpy()
-                tr_probs.extend(probs.tolist())
-                tr_labels.extend(yb.cpu().numpy().tolist())
-            else:
-                loss = criterion(logits, yb.long())
-                preds = logits.argmax(1)
-
-            loss.backward()
-            circuit_opt.step()
-            if H_opt:
-                H_opt.step()
-
-            tr_loss += loss.item() * len(yb)
-            tr_ok += (preds == yb.long()).sum().item()
-            tr_n += len(yb)
-
-        tr_loss /= tr_n
-        tr_acc = tr_ok / tr_n
-        tr_auc = compute_auc(tr_probs, tr_labels)
-
-        # Validate
-        model.eval()
-        vl_loss, vl_ok, vl_n = 0.0, 0, 0
-        vl_probs, vl_labels = [], []
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                logits = model(xb)
-
-                if output_dim == 1:
-                    logits = logits.squeeze(-1)
-                    loss = criterion(logits, yb.float())
-                    preds = (logits > 0).long()
-                    probs = torch.sigmoid(logits).detach().cpu().numpy()
-                    vl_probs.extend(probs.tolist())
-                    vl_labels.extend(yb.cpu().numpy().tolist())
-                else:
-                    loss = criterion(logits, yb.long())
-                    preds = logits.argmax(1)
-
-                vl_loss += loss.item() * len(yb)
-                vl_ok += (preds == yb.long()).sum().item()
-                vl_n += len(yb)
-
-        vl_loss /= vl_n
-        vl_acc = vl_ok / vl_n
-        vl_auc = compute_auc(vl_probs, vl_labels)
+        tr_loss, tr_metric = run_epoch(train_loader, training=True)
+        vl_loss, vl_metric = run_epoch(val_loader, training=False)
 
         eig_lo, eig_hi = model.get_eigenvalue_range()
         dt = time.time() - t0
 
-        # Log
         row = dict(epoch=epoch + 1, train_loss=f"{tr_loss:.6f}",
-                   train_acc=f"{tr_acc:.4f}", train_auc=f"{tr_auc:.4f}",
-                   val_loss=f"{vl_loss:.6f}", val_acc=f"{vl_acc:.4f}",
-                   val_auc=f"{vl_auc:.4f}",
+                   val_loss=f"{vl_loss:.6f}",
                    eig_min=f"{eig_lo:.4f}", eig_max=f"{eig_hi:.4f}",
                    time_s=f"{dt:.1f}")
+        row[f"train_{metric_name}"] = f"{tr_metric:.4f}"
+        row[f"val_{metric_name}"] = f"{vl_metric:.4f}"
         history.append(row)
+
         with open(csv_path, "a", newline="") as f:
             csv.DictWriter(f, csv_fields).writerow(row)
 
-        print(f"Ep {epoch+1:3d} | Train {100*tr_acc:.1f}% ({tr_loss:.4f}) "
-              f"AUC {tr_auc:.3f} | "
-              f"Val {100*vl_acc:.1f}% ({vl_loss:.4f}) AUC {vl_auc:.3f} | "
+        print(f"Ep {epoch+1:3d} | Train loss={tr_loss:.4f} "
+              f"{metric_name}={tr_metric:.4f} | "
+              f"Val loss={vl_loss:.4f} {metric_name}={vl_metric:.4f} | "
               f"Eig [{eig_lo:.2f}, {eig_hi:.2f}] | {dt:.1f}s")
 
-        if vl_acc > best_val_acc:
-            best_val_acc = vl_acc
+        if vl_metric > best_val_metric:
+            best_val_metric = vl_metric
             best_state = copy.deepcopy(model.state_dict())
             best_epoch = epoch + 1
             no_improve = 0
@@ -631,13 +674,12 @@ def main():
         ckpt_data = dict(
             epoch=epoch, model=model.state_dict(),
             circuit_opt=circuit_opt.state_dict(),
-            best_val_acc=best_val_acc, best_epoch=best_epoch,
+            best_val_metric=best_val_metric, best_epoch=best_epoch,
             history=history)
         if H_opt:
             ckpt_data["H_opt"] = H_opt.state_dict()
         torch.save(ckpt_data, ckpt_path)
 
-        # Early stopping
         if args.patience > 0 and no_improve >= args.patience:
             print(f"Early stopping at epoch {epoch+1} "
                   f"(no improvement for {args.patience} epochs)")
@@ -646,36 +688,12 @@ def main():
     # -- Final test --
     if best_state is not None:
         model.load_state_dict(best_state)
-    model.eval()
-    te_loss, te_ok, te_n = 0.0, 0, 0
-    te_probs, te_labels = [], []
-    with torch.no_grad():
-        for xb, yb in test_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            logits = model(xb)
 
-            if output_dim == 1:
-                logits = logits.squeeze(-1)
-                loss = criterion(logits, yb.float())
-                preds = (logits > 0).long()
-                probs = torch.sigmoid(logits).detach().cpu().numpy()
-                te_probs.extend(probs.tolist())
-                te_labels.extend(yb.cpu().numpy().tolist())
-            else:
-                loss = criterion(logits, yb.long())
-                preds = logits.argmax(1)
-
-            te_loss += loss.item() * len(yb)
-            te_ok += (preds == yb.long()).sum().item()
-            te_n += len(yb)
-
-    te_acc = te_ok / te_n
-    te_auc = compute_auc(te_probs, te_labels)
-
-    print(f"\nTest Accuracy: {100 * te_acc:.2f}%  AUC: {te_auc:.4f}  "
+    te_loss, te_metric = run_epoch(test_loader, training=False)
+    print(f"\nTest loss={te_loss:.4f}  {metric_name}={te_metric:.4f}  "
           f"(best val epoch: {best_epoch})")
 
-    w_path = os.path.join(ckpt_dir, f"weights_mqts_{args.job_id}.pt")
+    w_path = os.path.join(ckpt_dir, f"weights_mqts_nlp_{args.job_id}.pt")
     torch.save(model.state_dict(), w_path)
     print(f"Saved to {w_path}")
 

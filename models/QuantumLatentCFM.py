@@ -86,8 +86,10 @@ def get_args():
     p.add_argument("--encoding-type", type=str, default="sun",
                    choices=["sun", "angle"])
     p.add_argument("--vqc-type", type=str, default="qcnn",
-                   choices=["qcnn", "hardware_efficient", "none"])
+                   choices=["qcnn", "hardware_efficient", "qvit", "none"])
     p.add_argument("--vqc-depth", type=int, default=2)
+    p.add_argument("--qvit-circuit", type=str, default="butterfly",
+                   choices=["butterfly", "pyramid", "x"])
     p.add_argument("--k-local", type=int, default=2)
     p.add_argument("--obs-scheme", type=str, default="sliding",
                    choices=["sliding", "pairwise"])
@@ -158,6 +160,36 @@ def get_wire_groups(n_qubits, k_local, obs_scheme):
     elif obs_scheme == "pairwise":
         return [list(c) for c in combinations(range(n_qubits), k_local)]
     raise ValueError(f"Unknown obs_scheme: {obs_scheme}")
+
+
+def _qvit_n_params(n_qubits, circuit_type):
+    """Count RBS parameters per depth layer for a QViT topology.
+
+    Simulates the gate placement loop and counts only valid qubit pairs.
+
+    Args:
+        n_qubits: Number of qubits.
+        circuit_type: One of 'butterfly', 'pyramid', 'x'.
+    Returns:
+        int: Number of RBS gates (= trainable angles) per layer.
+    """
+    if circuit_type == "butterfly":
+        count = 0
+        n_layers = int(math.ceil(math.log2(n_qubits)))
+        for layer in range(n_layers):
+            stride = 2 ** layer
+            for start in range(0, n_qubits - stride, 2 * stride):
+                for offset in range(stride):
+                    idx1 = start + offset
+                    idx2 = start + offset + stride
+                    if idx1 < n_qubits and idx2 < n_qubits:
+                        count += 1
+        return count
+    elif circuit_type == "pyramid":
+        return n_qubits * (n_qubits - 1) // 2
+    elif circuit_type == "x":
+        return n_qubits // 2 + max(0, n_qubits // 2 - 1)
+    raise ValueError(f"Unknown qvit circuit_type: {circuit_type}")
 
 
 def sinusoidal_embedding(t, dim):
@@ -339,16 +371,18 @@ class ConvVAE(nn.Module):
 class QuantumVelocityField(nn.Module):
     """Quantum velocity field for latent CFM.
 
-    SU(4) encoding + QCNN + ANO measurement, with classical pre/post heads.
+    SU(4) encoding + QCNN/QViT/HWE + ANO measurement, with classical
+    pre/post heads.
 
     Forward (no skip — all info flows through quantum circuit):
       (z_t, t) -> [time_embed + concat] -> [FC -> enc_params]
-                -> [SU(4) encoding -> QCNN -> ANO measurement]
+                -> [SU(4) encoding -> QCNN/QViT/HWE -> ANO measurement]
                 -> [FC(q_out) -> velocity]
     """
 
     def __init__(self, latent_dim, n_qubits, n_blocks, encoding_type,
-                 vqc_type, vqc_depth, k_local, obs_scheme):
+                 vqc_type, vqc_depth, k_local, obs_scheme,
+                 qvit_circuit="butterfly"):
         super().__init__()
 
         self.latent_dim = latent_dim
@@ -358,6 +392,7 @@ class QuantumVelocityField(nn.Module):
         self.vqc_depth = vqc_depth
         self.k_local = k_local
         self.n_blocks = n_blocks
+        self.qvit_circuit = qvit_circuit
 
         time_dim = latent_dim
         input_dim = latent_dim + time_dim  # z_t + time_emb
@@ -387,6 +422,10 @@ class QuantumVelocityField(nn.Module):
         elif vqc_type == "hardware_efficient":
             self.var_params = nn.Parameter(
                 0.01 * torch.randn(vqc_depth, n_qubits))
+        elif vqc_type == "qvit":
+            n_rbs = _qvit_n_params(n_qubits, qvit_circuit)
+            self.qvit_params = nn.Parameter(
+                0.01 * torch.randn(vqc_depth, n_rbs))
 
         # -- ANO parameters --
         self.wire_groups = get_wire_groups(n_qubits, k_local, obs_scheme)
@@ -428,6 +467,7 @@ class QuantumVelocityField(nn.Module):
         _vd = vqc_depth
         _kl = k_local
         _no = self.n_obs
+        _qc = qvit_circuit
 
         @qml.qnode(dev, interface="torch", diff_method="best")
         def _circuit(enc, vqc_p1, vqc_p2, H_mats):
@@ -493,6 +533,52 @@ class QuantumVelocityField(nn.Module):
                     for q in range(1, _nq - 1, 2):
                         qml.CNOT(wires=[q, q + 1])
 
+            elif _vt == "qvit":
+                # RBS-based orthogonal layers (Cherrat et al., 2024)
+                # RBS(θ, w1, w2) = RY(2θ,w1) CNOT(w1,w2) RY(-2θ,w1) CNOT(w1,w2)
+                for ly in range(_vd):
+                    pidx = 0
+                    if _qc == "butterfly":
+                        n_layers = int(math.ceil(math.log2(_nq)))
+                        for layer in range(n_layers):
+                            stride = 2 ** layer
+                            for start in range(0, _nq - stride, 2 * stride):
+                                for offset in range(stride):
+                                    w1 = start + offset
+                                    w2 = start + offset + stride
+                                    if w1 < _nq and w2 < _nq:
+                                        th = vqc_p1[ly, pidx]
+                                        qml.RY(2 * th, wires=w1)
+                                        qml.CNOT(wires=[w1, w2])
+                                        qml.RY(-2 * th, wires=w1)
+                                        qml.CNOT(wires=[w1, w2])
+                                        pidx += 1
+                    elif _qc == "pyramid":
+                        for layer in range(_nq - 1):
+                            for i in range(_nq - layer - 1):
+                                th = vqc_p1[ly, pidx]
+                                qml.RY(2 * th, wires=i)
+                                qml.CNOT(wires=[i, i + 1])
+                                qml.RY(-2 * th, wires=i)
+                                qml.CNOT(wires=[i, i + 1])
+                                pidx += 1
+                    elif _qc == "x":
+                        for i in range(_nq // 2):
+                            w1, w2 = i, _nq - 1 - i
+                            th = vqc_p1[ly, pidx]
+                            qml.RY(2 * th, wires=w1)
+                            qml.CNOT(wires=[w1, w2])
+                            qml.RY(-2 * th, wires=w1)
+                            qml.CNOT(wires=[w1, w2])
+                            pidx += 1
+                        for i in range(_nq // 2 - 1):
+                            th = vqc_p1[ly, pidx]
+                            qml.RY(2 * th, wires=i)
+                            qml.CNOT(wires=[i, i + 1])
+                            qml.RY(-2 * th, wires=i)
+                            qml.CNOT(wires=[i, i + 1])
+                            pidx += 1
+
             # Stage 3: Measurement
             if _kl > 0:
                 return [qml.expval(qml.Hermitian(H_mats[w], wires=_wg[w]))
@@ -526,6 +612,8 @@ class QuantumVelocityField(nn.Module):
             p1, p2 = self.conv_params, self.pool_params
         elif self.vqc_type == "hardware_efficient":
             p1, p2 = self.var_params, torch.zeros(1)
+        elif self.vqc_type == "qvit":
+            p1, p2 = self.qvit_params, torch.zeros(1)
         else:
             p1, p2 = torch.zeros(1), torch.zeros(1)
 
@@ -678,6 +766,7 @@ def train_cfm(args, vae, train_loader, val_loader, device):
         n_blocks=args.n_blocks, encoding_type=args.encoding_type,
         vqc_type=args.vqc_type, vqc_depth=args.vqc_depth,
         k_local=args.k_local, obs_scheme=args.obs_scheme,
+        qvit_circuit=args.qvit_circuit,
     ).to(device)
 
     # Dual optimizer (Chen 2025)
@@ -929,6 +1018,7 @@ def main():
             n_blocks=args.n_blocks, encoding_type=args.encoding_type,
             vqc_type=args.vqc_type, vqc_depth=args.vqc_depth,
             k_local=args.k_local, obs_scheme=args.obs_scheme,
+            qvit_circuit=args.qvit_circuit,
         ).to(device)
         vf.load_state_dict(torch.load(cfm_path, weights_only=True))
 

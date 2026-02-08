@@ -6,9 +6,9 @@
 #SBATCH -c 32
 #SBATCH --gpus-per-task=1
 #SBATCH -t 48:00:00
-#SBATCH -J qlcfm_cfm
-#SBATCH -o qlcfm_cfm_%j.out
-#SBATCH -e qlcfm_cfm_%j.err
+#SBATCH -J qlcfm_coco_qvit
+#SBATCH -o qlcfm_coco_qvit_%j.out
+#SBATCH -e qlcfm_coco_qvit_%j.err
 
 export PYTHONNOUSERSITE=1
 eval "$(conda shell.bash hook 2>/dev/null)"
@@ -16,28 +16,27 @@ conda activate /pscratch/sd/j/junghoon/conda-envs/qml_eeg
 
 cd /pscratch/sd/j/junghoon/QuantumFlow
 
-# Set VAE checkpoint path (update after Phase 1 completes)
-VAE_CKPT="weights_vae_qlcfm_${VAE_JOB_ID}.pt"
-
 python models/QuantumLatentCFM.py \
-    --phase=2 \
-    --dataset=cifar10 \
+    --phase=both \
+    --dataset=coco \
     --latent-dim=128 \
+    --beta=0.5 \
     --n-qubits=8 \
     --n-blocks=2 \
     --encoding-type=sun \
-    --vqc-type=qcnn \
+    --vqc-type=qvit \
+    --qvit-circuit=butterfly \
     --vqc-depth=2 \
     --k-local=2 \
     --obs-scheme=sliding \
     --lr=1e-3 \
     --lr-H=1e-1 \
+    --lr-vae=1e-3 \
     --batch-size=32 \
-    --epochs=300 \
+    --epochs=200 \
     --n-train=50000 \
     --n-valtest=10000 \
     --seed=2025 \
-    --job-id=qlcfm_${SLURM_JOB_ID} \
-    --vae-ckpt=${VAE_CKPT} \
     --ode-steps=100 \
-    --n-samples=64
+    --n-samples=64 \
+    --job-id=qlcfm_coco_qvit_${SLURM_JOB_ID}
