@@ -341,10 +341,10 @@ class QuantumVelocityField(nn.Module):
 
     SU(4) encoding + QCNN + ANO measurement, with classical pre/post heads.
 
-    Forward:
+    Forward (no skip — all info flows through quantum circuit):
       (z_t, t) -> [time_embed + concat] -> [FC -> enc_params]
                 -> [SU(4) encoding -> QCNN -> ANO measurement]
-                -> [concat q_out + z_combined -> FC -> velocity]
+                -> [FC(q_out) -> velocity]
     """
 
     def __init__(self, latent_dim, n_qubits, n_blocks, encoding_type,
@@ -409,10 +409,10 @@ class QuantumVelocityField(nn.Module):
         else:
             self.obs_dim = 0
 
-        # Classical post-processing: (q_out, z_combined) -> velocity
-        post_in = self.n_obs + input_dim
+        # Classical post-processing: q_out -> velocity (no skip)
+        # All information must flow through the quantum circuit.
         self.vel_head = nn.Sequential(
-            nn.Linear(post_in, 256),
+            nn.Linear(self.n_obs, 256),
             nn.SiLU(),
             nn.Linear(256, latent_dim),
         )
@@ -532,8 +532,7 @@ class QuantumVelocityField(nn.Module):
         q_out = self._circuit(enc, p1, p2, H_mats)
         q_out = torch.stack(q_out, dim=1).float()
 
-        combined = torch.cat([q_out, z_combined], dim=-1)
-        return self.vel_head(combined)
+        return self.vel_head(q_out)
 
     def get_eigenvalue_range(self):
         if self.k_local <= 0:
