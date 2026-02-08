@@ -19,7 +19,7 @@ cd /pscratch/sd/j/junghoon/QuantumFlow
 # Set VAE checkpoint path (update after Phase 1 completes)
 VAE_CKPT="weights_vae_qlcfm_${VAE_JOB_ID}.pt"
 
-python QuantumLatentCFM.py \
+python models/QuantumLatentCFM.py \
     --phase=2 \
     --dataset=cifar10 \
     --latent-dim=128 \

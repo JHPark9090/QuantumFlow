@@ -559,9 +559,12 @@ def train_vae(args, train_loader, val_loader, device):
     total_p = sum(p.numel() for p in vae.parameters() if p.requires_grad)
     print(f"[Phase 1] VAE params: {total_p:,}")
 
-    os.makedirs(args.base_path, exist_ok=True)
-    ckpt_path = os.path.join(args.base_path, f"ckpt_vae_{args.job_id}.pt")
-    csv_path = os.path.join(args.base_path, f"log_vae_{args.job_id}.csv")
+    ckpt_dir = os.path.join(args.base_path, "checkpoints")
+    results_dir = os.path.join(args.base_path, "results")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, f"ckpt_vae_{args.job_id}.pt")
+    csv_path = os.path.join(results_dir, f"log_vae_{args.job_id}.csv")
     fields = ["epoch", "train_loss", "train_recon", "train_kl",
               "val_loss", "val_recon", "val_kl", "time_s"]
 
@@ -653,7 +656,7 @@ def train_vae(args, train_loader, val_loader, device):
     if best_state is not None:
         vae.load_state_dict(best_state)
 
-    w_path = os.path.join(args.base_path, f"weights_vae_{args.job_id}.pt")
+    w_path = os.path.join(ckpt_dir, f"weights_vae_{args.job_id}.pt")
     torch.save(vae.state_dict(), w_path)
     print(f"  VAE saved to {w_path}")
     return vae
@@ -699,9 +702,12 @@ def train_cfm(args, vae, train_loader, val_loader, device):
     print(f"  ANO: k_local={args.k_local}, scheme={args.obs_scheme}, "
           f"n_obs={vf.n_obs}")
 
-    os.makedirs(args.base_path, exist_ok=True)
-    ckpt_path = os.path.join(args.base_path, f"ckpt_cfm_{args.job_id}.pt")
-    csv_path = os.path.join(args.base_path, f"log_cfm_{args.job_id}.csv")
+    ckpt_dir = os.path.join(args.base_path, "checkpoints")
+    results_dir = os.path.join(args.base_path, "results")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, f"ckpt_cfm_{args.job_id}.pt")
+    csv_path = os.path.join(results_dir, f"log_cfm_{args.job_id}.csv")
     fields = ["epoch", "train_loss", "val_loss", "eig_min", "eig_max", "time_s"]
 
     start_epoch = 0
@@ -804,7 +810,7 @@ def train_cfm(args, vae, train_loader, val_loader, device):
     if best_state is not None:
         vf.load_state_dict(best_state)
 
-    w_path = os.path.join(args.base_path, f"weights_cfm_{args.job_id}.pt")
+    w_path = os.path.join(ckpt_dir, f"weights_cfm_{args.job_id}.pt")
     torch.save(vf.state_dict(), w_path)
     print(f"  CFM velocity field saved to {w_path}")
     return vf
@@ -884,7 +890,7 @@ def main():
         if vae is None:
             vae_path = args.vae_ckpt
             if not vae_path:
-                vae_path = os.path.join(args.base_path,
+                vae_path = os.path.join(args.base_path, "checkpoints",
                                         f"weights_vae_{args.job_id}.pt")
             if not os.path.exists(vae_path):
                 print(f"ERROR: VAE weights not found at {vae_path}")
@@ -897,7 +903,7 @@ def main():
         vf = train_cfm(args, vae, train_loader, val_loader, device)
 
         # Generate a sample grid
-        img_path = os.path.join(args.base_path,
+        img_path = os.path.join(args.base_path, "results",
                                 f"samples_{args.job_id}.png")
         generate_samples(vae, vf, min(args.n_samples, 64), args.ode_steps,
                          args.latent_dim, device, save_path=img_path)
@@ -906,9 +912,9 @@ def main():
     if args.phase == "generate":
         print("\n=== Generation ===")
         vae_path = args.vae_ckpt or os.path.join(
-            args.base_path, f"weights_vae_{args.job_id}.pt")
+            args.base_path, "checkpoints", f"weights_vae_{args.job_id}.pt")
         cfm_path = args.cfm_ckpt or os.path.join(
-            args.base_path, f"weights_cfm_{args.job_id}.pt")
+            args.base_path, "checkpoints", f"weights_cfm_{args.job_id}.pt")
 
         if not os.path.exists(vae_path) or not os.path.exists(cfm_path):
             print(f"ERROR: Need both VAE ({vae_path}) and "
@@ -926,7 +932,7 @@ def main():
         ).to(device)
         vf.load_state_dict(torch.load(cfm_path, weights_only=True))
 
-        img_path = os.path.join(args.base_path,
+        img_path = os.path.join(args.base_path, "results",
                                 f"generated_{args.job_id}.png")
         generate_samples(vae, vf, args.n_samples, args.ode_steps,
                          args.latent_dim, device, save_path=img_path)

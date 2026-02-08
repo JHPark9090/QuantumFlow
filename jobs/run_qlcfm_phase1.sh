@@ -16,7 +16,7 @@ conda activate /pscratch/sd/j/junghoon/conda-envs/qml_eeg
 
 cd /pscratch/sd/j/junghoon/QuantumFlow
 
-python QuantumLatentCFM.py \
+python models/QuantumLatentCFM.py \
     --phase=1 \
     --dataset=cifar10 \
     --latent-dim=128 \

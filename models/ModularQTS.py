@@ -42,8 +42,8 @@ from tqdm import tqdm
 import scipy.constants  # noqa: F401 -- pre-import for PennyLane/scipy compat
 import pennylane as qml
 
-# Import PhysioNet EEG loader from same directory
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Import data loaders from data/ subdirectory
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +407,7 @@ def main():
 
     # PhysioNet EEG Motor Imagery
     def load_physionet():
-        from Load_PhysioNet_EEG import load_eeg_ts_revised
+        from data.Load_PhysioNet_EEG import load_eeg_ts_revised
         return load_eeg_ts_revised(
             seed=args.seed, device=device, batch_size=args.batch_size,
             sampling_freq=args.sampling_freq, sample_size=args.sample_size)
@@ -476,9 +476,12 @@ def main():
     print(f"Params: total={total_p}  circuit={c_p}  observable={h_p}")
 
     # -- Checkpoint / CSV --
-    os.makedirs(args.base_path, exist_ok=True)
-    ckpt_path = os.path.join(args.base_path, f"ckpt_mqts_{args.job_id}.pt")
-    csv_path = os.path.join(args.base_path, f"log_mqts_{args.job_id}.csv")
+    ckpt_dir = os.path.join(args.base_path, "checkpoints")
+    results_dir = os.path.join(args.base_path, "results")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, f"ckpt_mqts_{args.job_id}.pt")
+    csv_path = os.path.join(results_dir, f"log_mqts_{args.job_id}.csv")
     csv_fields = ["epoch", "train_loss", "train_acc", "train_auc",
                   "val_loss", "val_acc", "val_auc",
                   "eig_min", "eig_max", "time_s"]
@@ -659,7 +662,7 @@ def main():
     print(f"\nTest Accuracy: {100 * te_acc:.2f}%  AUC: {te_auc:.4f}  "
           f"(best val epoch: {best_epoch})")
 
-    w_path = os.path.join(args.base_path, f"weights_mqts_{args.job_id}.pt")
+    w_path = os.path.join(ckpt_dir, f"weights_mqts_{args.job_id}.pt")
     torch.save(model.state_dict(), w_path)
     print(f"Saved to {w_path}")
 

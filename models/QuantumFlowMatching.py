@@ -392,8 +392,11 @@ def main():
     criterion = nn.CrossEntropyLoss()
 
     # --- Checkpoint loading ---
-    os.makedirs(args.base_path, exist_ok=True)
-    checkpoint_path = os.path.join(args.base_path, f"checkpoint_qfm_{args.job_id}.pt")
+    ckpt_dir = os.path.join(args.base_path, "checkpoints")
+    results_dir = os.path.join(args.base_path, "results")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+    checkpoint_path = os.path.join(ckpt_dir, f"checkpoint_qfm_{args.job_id}.pt")
     start_epoch = 0
     best_val_acc = 0.0
     best_state = None
@@ -412,7 +415,7 @@ def main():
         print(f"Resuming from epoch {start_epoch}")
 
     # --- CSV logger ---
-    csv_path = os.path.join(args.base_path, f"log_qfm_{args.job_id}.csv")
+    csv_path = os.path.join(results_dir, f"log_qfm_{args.job_id}.csv")
     csv_fields = ["epoch", "train_loss", "train_acc", "val_loss", "val_acc",
                   "eig_min", "eig_max", "epoch_time_s"]
 
@@ -536,7 +539,7 @@ def main():
     print(f"\nFinal Test Accuracy: {100*test_acc:.2f}% (best val epoch: {best_epoch})")
 
     # Save final model
-    weights_path = os.path.join(args.base_path, f"weights_qfm_{args.job_id}.pt")
+    weights_path = os.path.join(ckpt_dir, f"weights_qfm_{args.job_id}.pt")
     torch.save(model.state_dict(), weights_path)
     print(f"Model saved to {weights_path}")
 

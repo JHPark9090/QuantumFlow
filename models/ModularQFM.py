@@ -34,9 +34,9 @@ from tqdm import tqdm
 import scipy.constants  # noqa: F401 — pre-import for PennyLane/scipy compat
 import pennylane as qml
 
-# Import data loaders from the same directory
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from Load_Image_Datasets import load_mnist, load_fashion, load_cifar
+# Import data loaders from data/ subdirectory
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from data.Load_Image_Datasets import load_mnist, load_fashion, load_cifar
 
 
 # ---------------------------------------------------------------------------
@@ -464,9 +464,12 @@ def main():
     print(f"Params:    total={total_p}  circuit={c_p}  observable={h_p}")
 
     # ── Checkpoint / CSV ──
-    os.makedirs(args.base_path, exist_ok=True)
-    ckpt_path = os.path.join(args.base_path, f"ckpt_mqfm_{args.job_id}.pt")
-    csv_path = os.path.join(args.base_path, f"log_mqfm_{args.job_id}.csv")
+    ckpt_dir = os.path.join(args.base_path, "checkpoints")
+    results_dir = os.path.join(args.base_path, "results")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, f"ckpt_mqfm_{args.job_id}.pt")
+    csv_path = os.path.join(results_dir, f"log_mqfm_{args.job_id}.csv")
     csv_fields = ["epoch", "train_loss", "train_acc", "val_loss", "val_acc",
                   "eig_min", "eig_max", "time_s"]
 
@@ -580,7 +583,7 @@ def main():
     print(f"\nTest Accuracy: {100 * te_ok / te_n:.2f}% "
           f"(best val epoch: {best_epoch})")
 
-    w_path = os.path.join(args.base_path, f"weights_mqfm_{args.job_id}.pt")
+    w_path = os.path.join(ckpt_dir, f"weights_mqfm_{args.job_id}.pt")
     torch.save(model.state_dict(), w_path)
     print(f"Saved to {w_path}")
 
