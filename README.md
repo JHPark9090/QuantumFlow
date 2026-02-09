@@ -141,11 +141,23 @@ python models/QuantumLatentCFM.py --phase=generate --n-samples=64 \
 ### Text Generation (QuantumLatentCFM_Text)
 
 ```bash
-# Both phases + generation
-python models/QuantumLatentCFM_Text.py --phase=both --n-qubits=8 \
-    --degree=3 --n-layers=2 --k-local=2 --latent-dim=128 \
-    --seq-len=256 --epochs=50 --batch-size=32
+# Both phases + generation (text8, default)
+python models/QuantumLatentCFM_Text.py --phase=both --dataset=text8 \
+    --n-qubits=8 --degree=3 --n-layers=2 --k-local=2 \
+    --latent-dim=128 --seq-len=256 --epochs=200 --batch-size=64
+
+# Penn Treebank
+python models/QuantumLatentCFM_Text.py --phase=both --dataset=ptb \
+    --n-qubits=8 --degree=3 --n-layers=2 --k-local=2 \
+    --latent-dim=128 --seq-len=256 --epochs=200 --batch-size=64
+
+# WikiText-103
+python models/QuantumLatentCFM_Text.py --phase=both --dataset=wikitext-103 \
+    --n-qubits=8 --degree=3 --n-layers=2 --k-local=2 \
+    --latent-dim=128 --seq-len=256 --epochs=200 --batch-size=64
 ```
+
+Supported text datasets: `text8`, `wikitext-2`, `wikitext-103`, `ptb`
 
 ## Project Structure
 
@@ -165,7 +177,8 @@ QuantumFlow/
 ├── data/
 │   ├── Load_Image_Datasets.py        # MNIST, Fashion-MNIST, CIFAR-10 loaders
 │   ├── Load_PhysioNet_EEG.py         # PhysioNet Motor Imagery EEG loader
-│   └── Load_GLUE.py                  # HuggingFace GLUE with BERT tokenizer
+│   ├── Load_GLUE.py                  # HuggingFace GLUE with BERT tokenizer
+│   └── Load_Text_Datasets.py        # text8, WikiText-2/103, PTB (char-level)
 ├── jobs/                              # SLURM batch scripts
 ├── docs/                              # Paper summaries and design documents
 ├── reference/                         # Reference implementations
@@ -190,7 +203,10 @@ QuantumFlow/
 | COCO (2017) | Image | `Load_Image_Datasets.py` | QuantumLatentCFM |
 | PhysioNet EEG | Spatio-temporal | `Load_PhysioNet_EEG.py` | ModularQTS |
 | GLUE (SST-2, CoLA, MRPC, ...) | NLP | `Load_GLUE.py` | ModularQTS_NLP |
-| text8 | Character-level text | Built-in | QuantumLatentCFM_Text |
+| text8 | Character-level text (100M chars) | `Load_Text_Datasets.py` | QuantumLatentCFM_Text |
+| WikiText-2 | Character-level text (~13M chars) | `Load_Text_Datasets.py` | QuantumLatentCFM_Text |
+| WikiText-103 | Character-level text (~512M chars) | `Load_Text_Datasets.py` | QuantumLatentCFM_Text |
+| Penn Treebank (PTB) | Character-level text (~5.7M chars) | `Load_Text_Datasets.py` | QuantumLatentCFM_Text |
 
 ## Shared Components
 
