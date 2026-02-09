@@ -64,13 +64,12 @@ from tqdm import tqdm
 import scipy.constants  # noqa: F401 -- pre-import for PennyLane/scipy compat
 import pennylane as qml
 
-DATA_ROOT = "/pscratch/sd/j/junghoon/data"
-
-# Character mapping for text8: space + a-z = 27 chars
-VOCAB_SIZE = 27
-CHAR2IDX = {' ': 0}
-CHAR2IDX.update({chr(ord('a') + i): i + 1 for i in range(26)})
-IDX2CHAR = {v: k for k, v in CHAR2IDX.items()}
+# Ensure data/ package is importable when running from models/
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                ".."))
+from data.Load_Text_Datasets import (load_text_dataset, VOCAB_SIZE, CHAR2IDX,
+                                     IDX2CHAR, DATASET_REGISTRY,
+                                     decode_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +123,9 @@ def get_args():
     p.add_argument("--seed", type=int, default=2025)
 
     # Data
+    p.add_argument("--dataset", type=str, default="text8",
+                   choices=list(DATASET_REGISTRY.keys()),
+                   help="Text dataset: text8, wikitext-2, wikitext-103, ptb")
     p.add_argument("--n-train", type=int, default=10000)
     p.add_argument("--n-valtest", type=int, default=2000)
 
@@ -225,69 +227,7 @@ def sim14_circuit(params, wires, layers=1):
 
 
 # ---------------------------------------------------------------------------
-# 3. text8 Data Loader
-# ---------------------------------------------------------------------------
-def load_text8(seq_len, n_train, n_valtest, batch_size):
-    """Load text8 dataset and create DataLoaders."""
-    cache_dir = os.path.join(DATA_ROOT, "text8")
-    os.makedirs(cache_dir, exist_ok=True)
-    text8_path = os.path.join(cache_dir, "text8")
-
-    if not os.path.exists(text8_path):
-        zip_path = os.path.join(cache_dir, "text8.zip")
-        url = "http://mattmahoney.net/dc/text8.zip"
-        print(f"Downloading text8 from {url}...")
-        urllib.request.urlretrieve(url, zip_path)
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(cache_dir)
-        os.remove(zip_path)
-        print(f"Extracted to {text8_path}")
-
-    with open(text8_path, 'r') as f:
-        text = f.read().strip()
-
-    text = ''.join(c for c in text if c in CHAR2IDX)
-    print(f"text8: {len(text):,} characters")
-
-    data = np.array([CHAR2IDX[c] for c in text], dtype=np.int64)
-
-    total_needed = (n_train + n_valtest) * seq_len
-    if total_needed > len(data):
-        total_needed = len(data)
-        total_chunks = total_needed // seq_len
-        n_train = min(n_train, int(total_chunks * 0.8))
-        n_valtest = total_chunks - n_train
-        print(f"Adjusted: n_train={n_train}, n_valtest={n_valtest}")
-
-    n_chunks = total_needed // seq_len
-    data = data[:n_chunks * seq_len].reshape(n_chunks, seq_len)
-    data = torch.from_numpy(data).long()
-
-    perm = torch.randperm(n_chunks)
-    data = data[perm]
-
-    X_train = data[:n_train]
-    X_valtest = data[n_train:n_train + n_valtest]
-
-    train_ds = TensorDataset(X_train)
-    valtest_ds = TensorDataset(X_valtest)
-    val_sz = len(valtest_ds) // 2
-    test_sz = len(valtest_ds) - val_sz
-    val_ds, test_ds = random_split(valtest_ds, [val_sz, test_sz])
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
-
-    print(f"text8 splits: train={len(X_train)}  val={val_sz}  test={test_sz}  "
-          f"seq_len={seq_len}")
-
-    return train_loader, val_loader, test_loader
-
-
-# ---------------------------------------------------------------------------
-# 4. Mamba Components (Gu & Dao, 2023)
+# 3. Mamba Components (Gu & Dao, 2023)
 # ---------------------------------------------------------------------------
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -444,7 +384,7 @@ class MambaBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 5. MambaTextVAE
+# 4. MambaTextVAE
 # ---------------------------------------------------------------------------
 class MambaTextVAE(nn.Module):
     """Mamba-based VAE for character-level text.
@@ -523,15 +463,8 @@ class MambaTextVAE(nn.Module):
         return logits, mu, logvar
 
 
-def decode_tokens(tokens):
-    """Convert int tensor to string."""
-    if isinstance(tokens, torch.Tensor):
-        tokens = tokens.cpu().numpy()
-    return ''.join(IDX2CHAR.get(int(t), '?') for t in tokens)
-
-
 # ---------------------------------------------------------------------------
-# 6. QSVTVelocityField
+# 5. QSVTVelocityField
 # ---------------------------------------------------------------------------
 class QSVTVelocityField(nn.Module):
     """Velocity field for CFM using QSVT via LCU + QFF + ANO.
@@ -777,7 +710,7 @@ class QSVTVelocityField(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 7. Phase 1 -- MambaTextVAE Pretraining
+# 6. Phase 1 -- MambaTextVAE Pretraining
 # ---------------------------------------------------------------------------
 def train_text_vae(args, train_loader, val_loader, device):
     """Train the MambaTextVAE."""
@@ -925,7 +858,7 @@ def train_text_vae(args, train_loader, val_loader, device):
 
 
 # ---------------------------------------------------------------------------
-# 8. Phase 2 -- Quantum CFM Training (QSVTVelocityField)
+# 7. Phase 2 -- Quantum CFM Training (QSVTVelocityField)
 # ---------------------------------------------------------------------------
 def train_text_cfm(args, vae, train_loader, val_loader, device):
     """Train the QSVTVelocityField with CFM loss on text latents."""
@@ -1086,7 +1019,7 @@ def train_text_cfm(args, vae, train_loader, val_loader, device):
 
 
 # ---------------------------------------------------------------------------
-# 9. Generation via Euler ODE
+# 8. Generation via Euler ODE
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def generate_text(vae, vf, n_samples, ode_steps, latent_dim, device,
@@ -1130,7 +1063,7 @@ def generate_text(vae, vf, n_samples, ode_steps, latent_dim, device,
 
 
 # ---------------------------------------------------------------------------
-# 10. Main
+# 9. Main
 # ---------------------------------------------------------------------------
 def main():
     args = get_args()
@@ -1142,9 +1075,9 @@ def main():
     print(f"Phase: {args.phase}  |  Latent dim: {args.latent_dim}  |  "
           f"Seq len: {args.seq_len}")
 
-    # -- Load text8 data --
-    train_loader, val_loader, test_loader = load_text8(
-        seq_len=args.seq_len, n_train=args.n_train,
+    # -- Load text data --
+    train_loader, val_loader, test_loader = load_text_dataset(
+        dataset=args.dataset, seq_len=args.seq_len, n_train=args.n_train,
         n_valtest=args.n_valtest, batch_size=args.batch_size)
 
     # Helper to create VAE with current args
