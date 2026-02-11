@@ -3,3 +3,8 @@ __pycache__/
 .ipynb_checkpoints/
 *.pt
 *.csv
+*.out
+*.err
+checkpoints/
+results/
+data/

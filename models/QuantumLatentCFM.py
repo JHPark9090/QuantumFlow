@@ -121,6 +121,19 @@ def get_args():
     p.add_argument("--cfm-ckpt", type=str, default="")
     p.add_argument("--resume", action="store_true")
 
+    # Velocity field type
+    p.add_argument("--velocity-field", type=str, default="quantum",
+                   choices=["quantum", "classical"],
+                   help="quantum=QuantumVelocityField, classical=MLP baseline")
+    p.add_argument("--mlp-hidden-dims", type=str, default="256,256,256",
+                   help="Hidden layer dims for classical MLP velocity field")
+
+    # Evaluation metrics
+    p.add_argument("--compute-metrics", action="store_true",
+                   help="Compute FID and IS after Phase 2")
+    p.add_argument("--n-eval-samples", type=int, default=1024,
+                   help="Number of samples for FID/IS computation")
+
     return p.parse_args()
 
 
@@ -366,7 +379,49 @@ class ConvVAE(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 5. Quantum Velocity Field
+# 5a. Classical Velocity Field (MLP Baseline)
+# ---------------------------------------------------------------------------
+class ClassicalVelocityField(nn.Module):
+    """Classical MLP velocity field baseline (same interface as quantum)."""
+
+    def __init__(self, latent_dim=32, hidden_dims=(256, 256, 256),
+                 time_embed_dim=64):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.time_embed_dim = time_embed_dim
+
+        # Sinusoidal time embedding (same as diffusion models)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_embed_dim, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+        # MLP: (latent_dim + time_embed_dim) -> hidden -> latent_dim
+        dims = [latent_dim + time_embed_dim] + list(hidden_dims)
+        layers = []
+        for i in range(len(dims) - 1):
+            layers += [nn.Linear(dims[i], dims[i + 1]), nn.SiLU()]
+        layers.append(nn.Linear(dims[-1], latent_dim))
+        self.net = nn.Sequential(*layers)
+
+    def _time_embedding(self, t):
+        half = self.time_embed_dim // 2
+        freqs = torch.exp(
+            -math.log(10000.0) * torch.arange(half, device=t.device) / half)
+        args = t.unsqueeze(-1) * freqs
+        return torch.cat([args.cos(), args.sin()], dim=-1)
+
+    def forward(self, z_t, t):
+        t_emb = self.time_mlp(self._time_embedding(t))
+        return self.net(torch.cat([z_t, t_emb], dim=-1))
+
+    def get_eigenvalue_range(self):
+        return 0.0, 0.0  # no ANO observable -- keep CSV compat
+
+
+# ---------------------------------------------------------------------------
+# 5b. Quantum Velocity Field
 # ---------------------------------------------------------------------------
 class QuantumVelocityField(nn.Module):
     """Quantum velocity field for latent CFM.
@@ -424,8 +479,9 @@ class QuantumVelocityField(nn.Module):
                 0.01 * torch.randn(vqc_depth, n_qubits))
         elif vqc_type == "qvit":
             n_rbs = _qvit_n_params(n_qubits, qvit_circuit)
+            # 12 params per gate: 2×U3(3) + 2×(IsingXX+IsingYY+IsingZZ)(3)
             self.qvit_params = nn.Parameter(
-                0.01 * torch.randn(vqc_depth, n_rbs))
+                0.01 * torch.randn(vqc_depth, n_rbs, 12))
 
         # -- ANO parameters --
         self.wire_groups = get_wire_groups(n_qubits, k_local, obs_scheme)
@@ -534,8 +590,19 @@ class QuantumVelocityField(nn.Module):
                         qml.CNOT(wires=[q, q + 1])
 
             elif _vt == "qvit":
-                # RBS-based orthogonal layers (Cherrat et al., 2024)
-                # RBS(θ, w1, w2) = RY(2θ,w1) CNOT(w1,w2) RY(-2θ,w1) CNOT(w1,w2)
+                # Enhanced QViT layers: U3 + IsingXX/YY/ZZ
+                # Per gate pair: U3(w1) IsingXX/YY/ZZ(w1,w2) U3(w1) IsingXX/YY/ZZ(w1,w2)
+                # 12 params per gate: [U3(3), Ising(3), U3(3), Ising(3)]
+                def _qvit_gate(p, w1, w2):
+                    qml.U3(p[0], p[1], p[2], wires=w1)
+                    qml.IsingXX(p[3], wires=[w1, w2])
+                    qml.IsingYY(p[4], wires=[w1, w2])
+                    qml.IsingZZ(p[5], wires=[w1, w2])
+                    qml.U3(p[6], p[7], p[8], wires=w1)
+                    qml.IsingXX(p[9], wires=[w1, w2])
+                    qml.IsingYY(p[10], wires=[w1, w2])
+                    qml.IsingZZ(p[11], wires=[w1, w2])
+
                 for ly in range(_vd):
                     pidx = 0
                     if _qc == "butterfly":
@@ -547,36 +614,20 @@ class QuantumVelocityField(nn.Module):
                                     w1 = start + offset
                                     w2 = start + offset + stride
                                     if w1 < _nq and w2 < _nq:
-                                        th = vqc_p1[ly, pidx]
-                                        qml.RY(2 * th, wires=w1)
-                                        qml.CNOT(wires=[w1, w2])
-                                        qml.RY(-2 * th, wires=w1)
-                                        qml.CNOT(wires=[w1, w2])
+                                        _qvit_gate(vqc_p1[ly, pidx], w1, w2)
                                         pidx += 1
                     elif _qc == "pyramid":
                         for layer in range(_nq - 1):
                             for i in range(_nq - layer - 1):
-                                th = vqc_p1[ly, pidx]
-                                qml.RY(2 * th, wires=i)
-                                qml.CNOT(wires=[i, i + 1])
-                                qml.RY(-2 * th, wires=i)
-                                qml.CNOT(wires=[i, i + 1])
+                                _qvit_gate(vqc_p1[ly, pidx], i, i + 1)
                                 pidx += 1
                     elif _qc == "x":
                         for i in range(_nq // 2):
                             w1, w2 = i, _nq - 1 - i
-                            th = vqc_p1[ly, pidx]
-                            qml.RY(2 * th, wires=w1)
-                            qml.CNOT(wires=[w1, w2])
-                            qml.RY(-2 * th, wires=w1)
-                            qml.CNOT(wires=[w1, w2])
+                            _qvit_gate(vqc_p1[ly, pidx], w1, w2)
                             pidx += 1
                         for i in range(_nq // 2 - 1):
-                            th = vqc_p1[ly, pidx]
-                            qml.RY(2 * th, wires=i)
-                            qml.CNOT(wires=[i, i + 1])
-                            qml.RY(-2 * th, wires=i)
-                            qml.CNOT(wires=[i, i + 1])
+                            _qvit_gate(vqc_p1[ly, pidx], i, i + 1)
                             pidx += 1
 
             # Stage 3: Measurement
@@ -633,6 +684,26 @@ class QuantumVelocityField(nn.Module):
             lo = min(lo, eigs.min().item())
             hi = max(hi, eigs.max().item())
         return lo, hi
+
+
+# ---------------------------------------------------------------------------
+# 5c. Velocity Field Factory
+# ---------------------------------------------------------------------------
+def build_velocity_field(args, device):
+    """Factory: build quantum or classical velocity field."""
+    if args.velocity_field == "classical":
+        hidden = [int(d) for d in args.mlp_hidden_dims.split(",")]
+        vf = ClassicalVelocityField(
+            latent_dim=args.latent_dim, hidden_dims=hidden).to(device)
+    else:
+        vf = QuantumVelocityField(
+            latent_dim=args.latent_dim, n_qubits=args.n_qubits,
+            n_blocks=args.n_blocks, encoding_type=args.encoding_type,
+            vqc_type=args.vqc_type, vqc_depth=args.vqc_depth,
+            k_local=args.k_local, obs_scheme=args.obs_scheme,
+            qvit_circuit=args.qvit_circuit,
+        ).to(device)
+    return vf
 
 
 # ---------------------------------------------------------------------------
@@ -754,20 +825,14 @@ def train_vae(args, train_loader, val_loader, device):
 # 7. Phase 2 -- Quantum CFM Training
 # ---------------------------------------------------------------------------
 def train_cfm(args, vae, train_loader, val_loader, device):
-    """Train the quantum velocity field with CFM loss."""
+    """Train the velocity field (quantum or classical) with CFM loss."""
 
     # Freeze VAE
     vae.eval()
     for p in vae.parameters():
         p.requires_grad = False
 
-    vf = QuantumVelocityField(
-        latent_dim=args.latent_dim, n_qubits=args.n_qubits,
-        n_blocks=args.n_blocks, encoding_type=args.encoding_type,
-        vqc_type=args.vqc_type, vqc_depth=args.vqc_depth,
-        k_local=args.k_local, obs_scheme=args.obs_scheme,
-        qvit_circuit=args.qvit_circuit,
-    ).to(device)
+    vf = build_velocity_field(args, device)
 
     # Dual optimizer (Chen 2025)
     H_params, circuit_params = [], []
@@ -780,16 +845,24 @@ def train_cfm(args, vae, train_loader, val_loader, device):
     circ_opt = torch.optim.Adam(circuit_params, lr=args.lr)
     H_opt = torch.optim.Adam(H_params, lr=args.lr_H) if H_params else None
 
+    # Cosine annealing LR schedule
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+    circ_sched = CosineAnnealingLR(circ_opt, T_max=args.epochs)
+    H_sched = CosineAnnealingLR(H_opt, T_max=args.epochs) if H_opt else None
+
     total_p = sum(p.numel() for p in vf.parameters() if p.requires_grad)
     h_p = sum(p.numel() for p in H_params)
     c_p = sum(p.numel() for p in circuit_params)
     print(f"[Phase 2] Velocity field params: total={total_p}  "
           f"circuit={c_p}  observable={h_p}")
-    print(f"  Encoding: {args.encoding_type}, {args.n_blocks} blocks, "
-          f"{vf.total_enc} params")
-    print(f"  VQC: {args.vqc_type}, depth={args.vqc_depth}")
-    print(f"  ANO: k_local={args.k_local}, scheme={args.obs_scheme}, "
-          f"n_obs={vf.n_obs}")
+    if args.velocity_field == "quantum":
+        print(f"  Encoding: {args.encoding_type}, {args.n_blocks} blocks, "
+              f"{vf.total_enc} params")
+        print(f"  VQC: {args.vqc_type}, depth={args.vqc_depth}")
+        print(f"  ANO: k_local={args.k_local}, scheme={args.obs_scheme}, "
+              f"n_obs={vf.n_obs}")
+    else:
+        print(f"  Classical MLP: hidden_dims={args.mlp_hidden_dims}")
 
     ckpt_dir = os.path.join(args.base_path, "checkpoints")
     results_dir = os.path.join(args.base_path, "results")
@@ -808,6 +881,10 @@ def train_cfm(args, vae, train_loader, val_loader, device):
         circ_opt.load_state_dict(ckpt["circ_opt"])
         if H_opt and "H_opt" in ckpt:
             H_opt.load_state_dict(ckpt["H_opt"])
+        if "circ_sched" in ckpt:
+            circ_sched.load_state_dict(ckpt["circ_sched"])
+        if H_sched and "H_sched" in ckpt:
+            H_sched.load_state_dict(ckpt["H_sched"])
         start_epoch = ckpt["epoch"] + 1
         best_val = ckpt.get("best_val", float("inf"))
         print(f"  Resumed from epoch {start_epoch}")
@@ -889,11 +966,19 @@ def train_cfm(args, vae, train_loader, val_loader, device):
             best_val = vl_loss
             best_state = copy.deepcopy(vf.state_dict())
 
+        # Step LR schedulers
+        circ_sched.step()
+        if H_sched:
+            H_sched.step()
+
         ckpt_data = dict(epoch=epoch, model=vf.state_dict(),
                          circ_opt=circ_opt.state_dict(),
+                         circ_sched=circ_sched.state_dict(),
                          best_val=best_val)
         if H_opt:
             ckpt_data["H_opt"] = H_opt.state_dict()
+        if H_sched:
+            ckpt_data["H_sched"] = H_sched.state_dict()
         torch.save(ckpt_data, ckpt_path)
 
     if best_state is not None:
@@ -938,6 +1023,54 @@ def generate_samples(vae, vf, n_samples, ode_steps, latent_dim, device,
 
 
 # ---------------------------------------------------------------------------
+# 8b. FID & IS Evaluation
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def evaluate_fid_is(vae, vf, real_loader, n_samples, ode_steps,
+                    latent_dim, device, batch_size=64):
+    """Compute FID and IS for generated vs real images."""
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    from torchmetrics.image.inception import InceptionScore
+
+    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+    inception_score = InceptionScore(normalize=True).to(device)
+
+    # Add real images
+    n_real = 0
+    for (xb,) in real_loader:
+        xb = xb.to(device)
+        fid.update(xb, real=True)
+        n_real += xb.size(0)
+        if n_real >= n_samples:
+            break
+
+    # Generate and add fake images
+    vae.eval()
+    vf.eval()
+    n_gen = 0
+    while n_gen < n_samples:
+        bs = min(batch_size, n_samples - n_gen)
+        z = torch.randn(bs, latent_dim, device=device)
+        dt = 1.0 / ode_steps
+        for step in range(ode_steps):
+            t_val = step * dt
+            t = torch.full((bs,), t_val, device=device)
+            v = vf(z, t)
+            z = z + dt * v
+        imgs = vae.decode(z).clamp(0, 1)
+        fid.update(imgs, real=False)
+        inception_score.update(imgs)
+        n_gen += bs
+
+    fid_val = fid.compute().item()
+    is_mean, is_std = inception_score.compute()
+
+    print(f"  FID = {fid_val:.2f}")
+    print(f"  IS  = {is_mean.item():.2f} +/- {is_std.item():.2f}")
+    return {"fid": fid_val, "is_mean": is_mean.item(), "is_std": is_std.item()}
+
+
+# ---------------------------------------------------------------------------
 # 9. Main
 # ---------------------------------------------------------------------------
 def main():
@@ -973,7 +1106,8 @@ def main():
 
     # -- Phase 2: CFM --
     if args.phase in ("2", "both"):
-        print("\n=== Phase 2: Quantum CFM Training ===")
+        vf_label = args.velocity_field.capitalize()
+        print(f"\n=== Phase 2: {vf_label} CFM Training ===")
 
         # Load VAE if not already trained in this run
         if vae is None:
@@ -997,6 +1131,18 @@ def main():
         generate_samples(vae, vf, min(args.n_samples, 64), args.ode_steps,
                          args.latent_dim, device, save_path=img_path)
 
+        if args.compute_metrics:
+            print("\n=== Computing FID & IS ===")
+            metrics = evaluate_fid_is(
+                vae, vf, train_loader, args.n_eval_samples,
+                args.ode_steps, args.latent_dim, device)
+            import json
+            metrics_path = os.path.join(args.base_path, "results",
+                                        f"metrics_{args.job_id}.json")
+            with open(metrics_path, "w") as f:
+                json.dump(metrics, f, indent=2)
+            print(f"  Metrics saved to {metrics_path}")
+
     # -- Generate only --
     if args.phase == "generate":
         print("\n=== Generation ===")
@@ -1013,19 +1159,25 @@ def main():
         vae = ConvVAE(latent_dim=args.latent_dim).to(device)
         vae.load_state_dict(torch.load(vae_path, weights_only=True))
 
-        vf = QuantumVelocityField(
-            latent_dim=args.latent_dim, n_qubits=args.n_qubits,
-            n_blocks=args.n_blocks, encoding_type=args.encoding_type,
-            vqc_type=args.vqc_type, vqc_depth=args.vqc_depth,
-            k_local=args.k_local, obs_scheme=args.obs_scheme,
-            qvit_circuit=args.qvit_circuit,
-        ).to(device)
+        vf = build_velocity_field(args, device)
         vf.load_state_dict(torch.load(cfm_path, weights_only=True))
 
         img_path = os.path.join(args.base_path, "results",
                                 f"generated_{args.job_id}.png")
         generate_samples(vae, vf, args.n_samples, args.ode_steps,
                          args.latent_dim, device, save_path=img_path)
+
+        if args.compute_metrics:
+            print("\n=== Computing FID & IS ===")
+            metrics = evaluate_fid_is(
+                vae, vf, train_loader, args.n_eval_samples,
+                args.ode_steps, args.latent_dim, device)
+            import json
+            metrics_path = os.path.join(args.base_path, "results",
+                                        f"metrics_{args.job_id}.json")
+            with open(metrics_path, "w") as f:
+                json.dump(metrics, f, indent=2)
+            print(f"  Metrics saved to {metrics_path}")
 
     print("\nDone.")
 

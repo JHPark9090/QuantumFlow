@@ -38,6 +38,8 @@ python models/QuantumLatentCFM_Text.py \
     --n-train=10000 \
     --n-valtest=2000 \
     --seed=2025 \
+    --kl-warmup-epochs=10 \
+    --free-bits=0.1 \
     --job-id=text_cfm_wiki103_${SLURM_JOB_ID} \
     --ode-steps=100 \
     --n-samples=32 \

@@ -47,6 +47,7 @@ def sim14_circuit(params, wires, layers=1):
 #           SELECT([U(x₀),...,U(x_T)])            ← data-dependent unitaries
 #           PREPARE†
 #           PCPhase(φ_{k+1})                      ← signal processing
+#       Postselect ancilla → |0⟩ (extract QSVT result)
 #       QFF sim14 on main register
 #       → measure PauliX/Y/Z on main register
 #
@@ -200,6 +201,12 @@ class QuantumTSTransformer(torch.nn.Module):
                 qml.adjoint(prepare)()
                 qml.PCPhase(sig_ang[k + 1], dim=_pcphase_dim,
                             wires=_pcphase_wires)
+
+            # ── Postselect ancilla register to |0⟩ ──
+            # QSVT output: |0⟩_anc ⊗ P(M)|0⟩_main + |⊥⟩_anc ⊗ |garbage⟩_main
+            # Postselection projects onto ancilla=|0⟩, extracting P(M)|0⟩
+            for q in _anc_wires:
+                qml.measure(q, postselect=0)
 
             # ── QFF on main register ──
             sim14_circuit(qff_p, wires=_n_qubits, layers=1)

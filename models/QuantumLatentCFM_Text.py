@@ -10,13 +10,14 @@ Generative text model combining:
   3. Conditional Flow Matching (OT-CFM) training objective
 
 Architecture:
-  Phase 1 -- MambaTextVAE pretraining:
+  Phase 1 -- MambaTextVAE pretraining (autoregressive decoder):
     text8 sequence: (B, seq_len) int tokens (0-26)
       -> nn.Embedding(27, embed_dim) -> (B, seq_len, embed_dim)
       -> MambaBlock layers (selective SSM + gating)
       -> mean pool -> Linear -> mu, logvar -> z (latent_dim)
-      -> Decoder: z -> repeat -> MambaBlock layers -> Linear(d_model, 27)
-    Loss = CrossEntropy(logits, tokens) + beta * KL
+      -> Decoder: z + shifted_input -> Embedding -> MambaBlocks -> logits
+         (teacher forcing: predict char i from z + chars 0..i-1)
+    Loss = CrossEntropy(logits, tokens) + beta_t * KL (with annealing + free bits)
 
   Phase 2 -- Quantum CFM:
     z_1 = MambaTextVAE.encode(x).mu (frozen)
@@ -100,6 +101,10 @@ def get_args():
                    help="Character sequence length")
     p.add_argument("--beta", type=float, default=0.5,
                    help="KL weight in VAE loss")
+    p.add_argument("--kl-warmup-epochs", type=int, default=10,
+                   help="Linear KL beta warmup epochs (0=no warmup)")
+    p.add_argument("--free-bits", type=float, default=0.0,
+                   help="Free bits per dimension (0=disabled)")
 
     # QSVTVelocityField
     p.add_argument("--n-qubits", type=int, default=8)
@@ -387,10 +392,11 @@ class MambaBlock(nn.Module):
 # 4. MambaTextVAE
 # ---------------------------------------------------------------------------
 class MambaTextVAE(nn.Module):
-    """Mamba-based VAE for character-level text.
+    """Mamba-based VAE for character-level text (autoregressive decoder).
 
     Encoder: Embedding -> MambaBlocks -> mean pool -> mu, logvar
-    Decoder: z -> Linear -> repeat to seq_len -> MambaBlocks -> Linear -> logits
+    Decoder: z + shifted_input -> Embedding -> MambaBlocks -> Linear -> logits
+             (teacher forcing during training, token-by-token at generation)
     """
 
     def __init__(self, vocab_size=27, embed_dim=64, d_model=256,
@@ -413,7 +419,9 @@ class MambaTextVAE(nn.Module):
         self.fc_mu = nn.Linear(d_model, latent_dim)
         self.fc_logvar = nn.Linear(d_model, latent_dim)
 
-        # Decoder
+        # Decoder (autoregressive with teacher forcing)
+        self.dec_embed = nn.Embedding(vocab_size, embed_dim)
+        self.dec_proj = nn.Linear(embed_dim, d_model)
         self.fc_dec = nn.Linear(latent_dim, d_model)
         self.decoder_blocks = nn.ModuleList([
             MambaBlock(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
@@ -441,16 +449,18 @@ class MambaTextVAE(nn.Module):
         std = torch.exp(0.5 * logvar)
         return mu + std * torch.randn_like(std)
 
-    def decode(self, z):
-        """Decode latent vector to token logits.
+    def decode(self, z, x_prev):
+        """Decode latent vector to token logits (autoregressive with teacher forcing).
 
         Args:
             z: (B, latent_dim)
+            x_prev: (B, L) int token IDs (shifted-right input for teacher forcing)
         Returns:
-            logits: (B, seq_len, vocab_size)
+            logits: (B, L, vocab_size)
         """
-        h = F.silu(self.fc_dec(z))                         # (B, d_model)
-        h = h.unsqueeze(1).expand(-1, self.seq_len, -1)    # (B, L, d_model)
+        z_cond = F.silu(self.fc_dec(z))                    # (B, d_model)
+        h = self.dec_proj(self.dec_embed(x_prev))          # (B, L, d_model)
+        h = h + z_cond.unsqueeze(1)                        # broadcast z
         for block in self.decoder_blocks:
             h = block(h)
         h = self.dec_norm(h)
@@ -459,8 +469,42 @@ class MambaTextVAE(nn.Module):
     def forward(self, x):
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        logits = self.decode(z)
+        # Teacher forcing: shift right, BOS = token 0 (space)
+        x_prev = torch.zeros_like(x)
+        x_prev[:, 1:] = x[:, :-1]
+        logits = self.decode(z, x_prev)
         return logits, mu, logvar
+
+    @torch.no_grad()
+    def generate(self, z, max_len=None, temperature=1.0):
+        """Autoregressive token-by-token generation.
+
+        Args:
+            z: (B, latent_dim)
+            max_len: sequence length (defaults to self.seq_len)
+            temperature: sampling temperature (0=greedy)
+        Returns:
+            tokens: (B, max_len) int token IDs
+        """
+        if max_len is None:
+            max_len = self.seq_len
+        B, device = z.size(0), z.device
+        z_cond = F.silu(self.fc_dec(z))                    # (B, d_model)
+        generated = torch.zeros(B, 1, dtype=torch.long, device=device)  # BOS
+        for t in range(max_len):
+            h = self.dec_proj(self.dec_embed(generated))   # (B, t+1, d_model)
+            h = h + z_cond.unsqueeze(1)
+            for block in self.decoder_blocks:
+                h = block(h)
+            h = self.dec_norm(h)
+            logits_t = self.output_proj(h[:, -1, :])       # (B, vocab_size)
+            if temperature > 0:
+                next_token = torch.multinomial(
+                    F.softmax(logits_t / temperature, dim=-1), 1)
+            else:
+                next_token = logits_t.argmax(dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token], dim=1)
+        return generated[:, 1:]  # remove BOS
 
 
 # ---------------------------------------------------------------------------
@@ -738,8 +782,9 @@ def train_text_vae(args, train_loader, val_loader, device):
     os.makedirs(results_dir, exist_ok=True)
     ckpt_path = os.path.join(ckpt_dir, f"ckpt_text_vae_{args.job_id}.pt")
     csv_path = os.path.join(results_dir, f"log_text_vae_{args.job_id}.csv")
-    fields = ["epoch", "train_loss", "train_ce", "train_kl", "train_bpc",
-              "val_loss", "val_ce", "val_kl", "val_bpc", "time_s"]
+    fields = ["epoch", "beta", "train_loss", "train_ce", "train_kl",
+              "train_bpc", "val_loss", "val_ce", "val_kl", "val_bpc",
+              "time_s"]
 
     start_epoch = 0
     best_val, best_state = float("inf"), None
@@ -759,6 +804,12 @@ def train_text_vae(args, train_loader, val_loader, device):
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
+        # KL annealing schedule
+        if args.kl_warmup_epochs > 0 and epoch < args.kl_warmup_epochs:
+            beta_t = args.beta * (epoch + 1) / args.kl_warmup_epochs
+        else:
+            beta_t = args.beta
+
         # -- Train --
         vae.train()
         tr_loss, tr_ce, tr_kl, tr_n = 0.0, 0.0, 0.0, 0
@@ -771,8 +822,11 @@ def train_text_vae(args, train_loader, val_loader, device):
             ce = F.cross_entropy(
                 logits.reshape(-1, VOCAB_SIZE), xb.reshape(-1),
                 reduction="mean")
-            kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-            loss = ce + args.beta * kl
+            kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+            if args.free_bits > 0:
+                kl_per_dim = torch.clamp(kl_per_dim, min=args.free_bits)
+            kl = kl_per_dim.mean()
+            loss = ce + beta_t * kl
 
             optimizer.zero_grad()
             loss.backward()
@@ -800,8 +854,11 @@ def train_text_vae(args, train_loader, val_loader, device):
                 ce = F.cross_entropy(
                     logits.reshape(-1, VOCAB_SIZE), xb.reshape(-1),
                     reduction="mean")
-                kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                loss = ce + args.beta * kl
+                kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+                if args.free_bits > 0:
+                    kl_per_dim = torch.clamp(kl_per_dim, min=args.free_bits)
+                kl = kl_per_dim.mean()
+                loss = ce + beta_t * kl
 
                 bs = xb.size(0)
                 vl_loss += loss.item() * bs
@@ -815,7 +872,7 @@ def train_text_vae(args, train_loader, val_loader, device):
         vl_bpc = vl_ce / math.log(2)
         dt = time.time() - t0
 
-        row = dict(epoch=epoch + 1,
+        row = dict(epoch=epoch + 1, beta=f"{beta_t:.4f}",
                    train_loss=f"{tr_loss:.6f}", train_ce=f"{tr_ce:.6f}",
                    train_kl=f"{tr_kl:.6f}", train_bpc=f"{tr_bpc:.4f}",
                    val_loss=f"{vl_loss:.6f}", val_ce=f"{vl_ce:.6f}",
@@ -824,7 +881,7 @@ def train_text_vae(args, train_loader, val_loader, device):
         with open(csv_path, "a", newline="") as f:
             csv.DictWriter(f, fields).writerow(row)
 
-        print(f"  Ep {epoch+1:3d} | Train {tr_loss:.4f} "
+        print(f"  Ep {epoch+1:3d} | beta={beta_t:.3f} | Train {tr_loss:.4f} "
               f"(ce={tr_ce:.4f} kl={tr_kl:.4f} bpc={tr_bpc:.3f}) | "
               f"Val {vl_loss:.4f} bpc={vl_bpc:.3f} | {dt:.1f}s")
 
@@ -1037,15 +1094,7 @@ def generate_text(vae, vf, n_samples, ode_steps, latent_dim, device,
         v = vf(z, t)
         z = z + dt * v
 
-    logits = vae.decode(z)
-
-    if temperature > 0:
-        probs = F.softmax(logits / temperature, dim=-1)
-        tokens = torch.multinomial(
-            probs.reshape(-1, VOCAB_SIZE), num_samples=1
-        ).reshape(n_samples, -1)
-    else:
-        tokens = logits.argmax(dim=-1)
+    tokens = vae.generate(z, temperature=temperature)
 
     texts = [decode_tokens(tokens[i]) for i in range(n_samples)]
 
