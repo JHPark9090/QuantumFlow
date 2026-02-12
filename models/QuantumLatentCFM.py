@@ -75,9 +75,16 @@ def get_args():
                    help="1=VAE pretrain, 2=CFM train, generate=sample, both=1+2")
 
     # VAE
-    p.add_argument("--latent-dim", type=int, default=128)
+    p.add_argument("--latent-dim", type=int, default=256)
     p.add_argument("--beta", type=float, default=0.5,
                    help="KL weight in VAE loss")
+    p.add_argument("--beta-warmup-epochs", type=int, default=20,
+                   help="Linear ramp from 0 to beta over this many epochs")
+    p.add_argument("--lambda-perc", type=float, default=0.1,
+                   help="VGG perceptual loss weight (0 to disable)")
+    p.add_argument("--vae-arch", type=str, default="resconv",
+                   choices=["resconv", "legacy"],
+                   help="VAE architecture: resconv (deep residual) or legacy")
 
     # Quantum circuit
     p.add_argument("--n-qubits", type=int, default=8)
@@ -376,6 +383,119 @@ class ConvVAE(nn.Module):
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
         return self.decode(z), mu, logvar
+
+
+class ResidualBlock(nn.Module):
+    """Pre-activation residual block: BN -> ReLU -> Conv -> BN -> ReLU -> Conv + skip."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, 1, 1, bias=False),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+
+class ResConvVAE(nn.Module):
+    """Deep residual VAE for 32x32x3 images (~2.1M params)."""
+
+    def __init__(self, latent_dim=256, in_channels=3):
+        super().__init__()
+        self.latent_dim = latent_dim
+
+        # Encoder: (3,32,32) -> ... -> (256,2,2) -> flat -> mu, logvar
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, 1, 1, bias=False),
+            ResidualBlock(32), ResidualBlock(32),
+            nn.Conv2d(32, 64, 4, 2, 1, bias=False),          # -> (64,16,16)
+            ResidualBlock(64), ResidualBlock(64),
+            nn.Conv2d(64, 128, 4, 2, 1, bias=False),         # -> (128,8,8)
+            ResidualBlock(128), ResidualBlock(128),
+            nn.Conv2d(128, 256, 4, 2, 1, bias=False),        # -> (256,4,4)
+            ResidualBlock(256), ResidualBlock(256),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, 4, 2, 1, bias=False),        # -> (256,2,2)
+        )
+        flat_dim = 256 * 2 * 2  # 1024
+        self.fc_mu = nn.Linear(flat_dim, latent_dim)
+        self.fc_logvar = nn.Linear(flat_dim, latent_dim)
+
+        # Decoder: latent -> (256,2,2) -> mirror of encoder -> (3,32,32)
+        self.fc_dec = nn.Linear(latent_dim, flat_dim)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(256, 256, 4, 2, 1, bias=False),  # -> (256,4,4)
+            ResidualBlock(256), ResidualBlock(256),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),  # -> (128,8,8)
+            ResidualBlock(128), ResidualBlock(128),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1, bias=False),   # -> (64,16,16)
+            ResidualBlock(64), ResidualBlock(64),
+            nn.ConvTranspose2d(64, 32, 4, 2, 1, bias=False),    # -> (32,32,32)
+            ResidualBlock(32), ResidualBlock(32),
+            nn.Conv2d(32, in_channels, 3, 1, 1), nn.Sigmoid(),
+        )
+
+    def encode(self, x):
+        h = self.encoder(x).view(x.size(0), -1)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        return mu + std * torch.randn_like(std)
+
+    def decode(self, z):
+        h = F.relu(self.fc_dec(z)).view(-1, 256, 2, 2)
+        return self.decoder(h)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+
+def build_vae(args, latent_dim=None, in_channels=3):
+    """Factory: return ResConvVAE or legacy ConvVAE based on args."""
+    ldim = latent_dim or args.latent_dim
+    arch = getattr(args, "vae_arch", "resconv")
+    if arch == "resconv":
+        return ResConvVAE(latent_dim=ldim, in_channels=in_channels)
+    return ConvVAE(latent_dim=ldim, in_channels=in_channels)
+
+
+class VGGPerceptualLoss(nn.Module):
+    """Perceptual loss using frozen VGG16 features (relu1_2, 2_2, 3_3, 4_3)."""
+
+    def __init__(self):
+        super().__init__()
+        from torchvision.models import vgg16, VGG16_Weights
+        vgg = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
+        slices = [4, 9, 16, 23]  # relu1_2, relu2_2, relu3_3, relu4_3
+        self.blocks = nn.ModuleList()
+        prev = 0
+        for s in slices:
+            self.blocks.append(nn.Sequential(*list(vgg.children())[prev:s]))
+            prev = s
+        for p in self.parameters():
+            p.requires_grad = False
+        # ImageNet normalization
+        self.register_buffer("mean",
+                             torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std",
+                             torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, x, y):
+        x = (x - self.mean) / self.std
+        y = (y - self.mean) / self.std
+        loss = 0.0
+        for block in self.blocks:
+            x = block(x)
+            y = block(y)
+            loss += F.l1_loss(x, y)
+        return loss / len(self.blocks)
 
 
 # ---------------------------------------------------------------------------
@@ -712,11 +832,19 @@ def build_velocity_field(args, device):
 def train_vae(args, train_loader, val_loader, device):
     """Train the convolutional VAE."""
 
-    vae = ConvVAE(latent_dim=args.latent_dim).to(device)
+    vae = build_vae(args).to(device)
     optimizer = torch.optim.Adam(vae.parameters(), lr=args.lr_vae)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-6)
+
+    # Optional perceptual loss
+    perc_fn = None
+    if args.lambda_perc > 0:
+        perc_fn = VGGPerceptualLoss().to(device)
+        print(f"[Phase 1] VGG perceptual loss enabled (lambda={args.lambda_perc})")
 
     total_p = sum(p.numel() for p in vae.parameters() if p.requires_grad)
-    print(f"[Phase 1] VAE params: {total_p:,}")
+    print(f"[Phase 1] VAE arch={args.vae_arch}  params: {total_p:,}")
 
     ckpt_dir = os.path.join(args.base_path, "checkpoints")
     results_dir = os.path.join(args.base_path, "results")
@@ -724,8 +852,9 @@ def train_vae(args, train_loader, val_loader, device):
     os.makedirs(results_dir, exist_ok=True)
     ckpt_path = os.path.join(ckpt_dir, f"ckpt_vae_{args.job_id}.pt")
     csv_path = os.path.join(results_dir, f"log_vae_{args.job_id}.csv")
-    fields = ["epoch", "train_loss", "train_recon", "train_kl",
-              "val_loss", "val_recon", "val_kl", "time_s"]
+    fields = ["epoch", "train_loss", "train_recon", "train_kl", "train_perc",
+              "val_loss", "val_recon", "val_kl", "val_perc",
+              "beta_eff", "lr", "time_s"]
 
     start_epoch = 0
     best_val, best_state = float("inf"), None
@@ -734,6 +863,8 @@ def train_vae(args, train_loader, val_loader, device):
         ckpt = torch.load(ckpt_path, weights_only=False)
         vae.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_val = ckpt.get("best_val", float("inf"))
         print(f"  Resumed from epoch {start_epoch}")
@@ -742,12 +873,16 @@ def train_vae(args, train_loader, val_loader, device):
         with open(csv_path, "w", newline="") as f:
             csv.DictWriter(f, fields).writeheader()
 
+    warmup = max(args.beta_warmup_epochs, 1)
+
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
+        beta_eff = args.beta * min(1.0, (epoch + 1) / warmup)
+        cur_lr = optimizer.param_groups[0]["lr"]
 
         # -- Train --
         vae.train()
-        tr_loss, tr_rec, tr_kl, tr_n = 0.0, 0.0, 0.0, 0
+        tr_loss, tr_rec, tr_kl, tr_perc, tr_n = 0.0, 0.0, 0.0, 0.0, 0
         for (xb,) in tqdm(train_loader, desc=f"VAE Ep {epoch+1}/{args.epochs}",
                           leave=False):
             xb = xb.to(device)
@@ -755,7 +890,13 @@ def train_vae(args, train_loader, val_loader, device):
 
             recon = F.mse_loss(x_hat, xb, reduction="mean")
             kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-            loss = recon + args.beta * kl
+            loss = recon + beta_eff * kl
+
+            perc_val = 0.0
+            if perc_fn is not None:
+                perc = perc_fn(x_hat, xb)
+                loss = loss + args.lambda_perc * perc
+                perc_val = perc.item()
 
             optimizer.zero_grad()
             loss.backward()
@@ -765,44 +906,58 @@ def train_vae(args, train_loader, val_loader, device):
             tr_loss += loss.item() * bs
             tr_rec += recon.item() * bs
             tr_kl += kl.item() * bs
+            tr_perc += perc_val * bs
             tr_n += bs
 
         tr_loss /= tr_n
         tr_rec /= tr_n
         tr_kl /= tr_n
+        tr_perc /= tr_n
 
         # -- Val --
         vae.eval()
-        vl_loss, vl_rec, vl_kl, vl_n = 0.0, 0.0, 0.0, 0
+        vl_loss, vl_rec, vl_kl, vl_perc, vl_n = 0.0, 0.0, 0.0, 0.0, 0
         with torch.no_grad():
             for (xb,) in val_loader:
                 xb = xb.to(device)
                 x_hat, mu, logvar = vae(xb)
                 recon = F.mse_loss(x_hat, xb, reduction="mean")
                 kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                loss = recon + args.beta * kl
+                loss = recon + beta_eff * kl
+
+                perc_val = 0.0
+                if perc_fn is not None:
+                    perc = perc_fn(x_hat, xb)
+                    loss = loss + args.lambda_perc * perc
+                    perc_val = perc.item()
 
                 bs = xb.size(0)
                 vl_loss += loss.item() * bs
                 vl_rec += recon.item() * bs
                 vl_kl += kl.item() * bs
+                vl_perc += perc_val * bs
                 vl_n += bs
 
         vl_loss /= vl_n
         vl_rec /= vl_n
         vl_kl /= vl_n
+        vl_perc /= vl_n
         dt = time.time() - t0
 
         row = dict(epoch=epoch + 1, train_loss=f"{tr_loss:.6f}",
                    train_recon=f"{tr_rec:.6f}", train_kl=f"{tr_kl:.6f}",
+                   train_perc=f"{tr_perc:.6f}",
                    val_loss=f"{vl_loss:.6f}", val_recon=f"{vl_rec:.6f}",
-                   val_kl=f"{vl_kl:.6f}", time_s=f"{dt:.1f}")
+                   val_kl=f"{vl_kl:.6f}", val_perc=f"{vl_perc:.6f}",
+                   beta_eff=f"{beta_eff:.4f}", lr=f"{cur_lr:.2e}",
+                   time_s=f"{dt:.1f}")
         with open(csv_path, "a", newline="") as f:
             csv.DictWriter(f, fields).writerow(row)
 
         print(f"  Ep {epoch+1:3d} | Train {tr_loss:.4f} "
-              f"(rec={tr_rec:.4f} kl={tr_kl:.4f}) | "
-              f"Val {vl_loss:.4f} | {dt:.1f}s")
+              f"(rec={tr_rec:.4f} kl={tr_kl:.4f} perc={tr_perc:.4f}) | "
+              f"Val {vl_loss:.4f} | beta={beta_eff:.3f} lr={cur_lr:.2e} | "
+              f"{dt:.1f}s")
 
         if vl_loss < best_val:
             best_val = vl_loss
@@ -810,7 +965,11 @@ def train_vae(args, train_loader, val_loader, device):
 
         torch.save(dict(epoch=epoch, model=vae.state_dict(),
                         optimizer=optimizer.state_dict(),
+                        scheduler=scheduler.state_dict(),
+                        vae_arch=args.vae_arch,
                         best_val=best_val), ckpt_path)
+
+        scheduler.step()
 
     if best_state is not None:
         vae.load_state_dict(best_state)
@@ -1119,7 +1278,7 @@ def main():
                 print(f"ERROR: VAE weights not found at {vae_path}")
                 print("  Run --phase=1 first or provide --vae-ckpt=<path>")
                 return
-            vae = ConvVAE(latent_dim=args.latent_dim).to(device)
+            vae = build_vae(args).to(device)
             vae.load_state_dict(torch.load(vae_path, weights_only=True))
             print(f"  Loaded VAE from {vae_path}")
 
@@ -1156,7 +1315,7 @@ def main():
                   f"CFM ({cfm_path}) weights")
             return
 
-        vae = ConvVAE(latent_dim=args.latent_dim).to(device)
+        vae = build_vae(args).to(device)
         vae.load_state_dict(torch.load(vae_path, weights_only=True))
 
         vf = build_velocity_field(args, device)
