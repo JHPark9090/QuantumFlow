@@ -100,6 +100,10 @@ def get_args():
     p.add_argument("--k-local", type=int, default=2)
     p.add_argument("--obs-scheme", type=str, default="sliding",
                    choices=["sliding", "pairwise"])
+    p.add_argument("--vel-head-hidden", type=int, default=0,
+                   help="vel_head hidden dim (0=auto: max(256, n_obs))")
+    p.add_argument("--n-reupload", type=int, default=1,
+                   help="Data re-upload rounds (1=standard, >1=interleaved encode+VQC)")
 
     # Training
     p.add_argument("--lr", type=float, default=1e-3)
@@ -557,7 +561,8 @@ class QuantumVelocityField(nn.Module):
 
     def __init__(self, latent_dim, n_qubits, n_blocks, encoding_type,
                  vqc_type, vqc_depth, k_local, obs_scheme,
-                 qvit_circuit="butterfly"):
+                 qvit_circuit="butterfly", vel_head_hidden=0,
+                 n_reupload=1):
         super().__init__()
 
         self.latent_dim = latent_dim
@@ -569,6 +574,13 @@ class QuantumVelocityField(nn.Module):
         self.n_blocks = n_blocks
         self.qvit_circuit = qvit_circuit
 
+        # QCNN excluded from re-uploading (already OOMs)
+        if n_reupload > 1 and vqc_type == "qcnn":
+            print(f"WARNING: QCNN does not support n_reupload>1, "
+                  f"falling back to n_reupload=1")
+            n_reupload = 1
+        self.n_reupload = n_reupload
+
         time_dim = latent_dim
         input_dim = latent_dim + time_dim  # z_t + time_emb
 
@@ -577,9 +589,14 @@ class QuantumVelocityField(nn.Module):
             n_even = n_qubits // 2
             n_odd = (n_qubits - 1) // 2
             gates_per_block = n_even + n_odd
-            self.total_enc = n_blocks * gates_per_block * 15
+            enc_per_block = gates_per_block * 15
         else:
-            self.total_enc = n_blocks * n_qubits
+            enc_per_block = n_qubits
+
+        if n_reupload > 1:
+            self.total_enc = n_reupload * enc_per_block
+        else:
+            self.total_enc = n_blocks * enc_per_block
 
         # Classical pre-processing: z_combined -> encoding params
         self.enc_proj = nn.Sequential(
@@ -595,13 +612,15 @@ class QuantumVelocityField(nn.Module):
             self.pool_params = nn.Parameter(
                 0.01 * torch.randn(vqc_depth, n_qubits // 2, 3))
         elif vqc_type == "hardware_efficient":
+            _depth = n_reupload if n_reupload > 1 else vqc_depth
             self.var_params = nn.Parameter(
-                0.01 * torch.randn(vqc_depth, n_qubits))
+                0.01 * torch.randn(_depth, n_qubits))
         elif vqc_type == "qvit":
             n_rbs = _qvit_n_params(n_qubits, qvit_circuit)
+            _depth = n_reupload if n_reupload > 1 else vqc_depth
             # 12 params per gate: 2×U3(3) + 2×(IsingXX+IsingYY+IsingZZ)(3)
             self.qvit_params = nn.Parameter(
-                0.01 * torch.randn(vqc_depth, n_rbs, 12))
+                0.01 * torch.randn(_depth, n_rbs, 12))
 
         # -- ANO parameters --
         self.wire_groups = get_wire_groups(n_qubits, k_local, obs_scheme)
@@ -626,10 +645,11 @@ class QuantumVelocityField(nn.Module):
 
         # Classical post-processing: q_out -> velocity (no skip)
         # All information must flow through the quantum circuit.
+        _vh = vel_head_hidden if vel_head_hidden > 0 else max(256, self.n_obs)
         self.vel_head = nn.Sequential(
-            nn.Linear(self.n_obs, 256),
+            nn.Linear(self.n_obs, _vh),
             nn.SiLU(),
-            nn.Linear(256, latent_dim),
+            nn.Linear(_vh, latent_dim),
         )
 
         # -- Build QNode --
@@ -644,113 +664,178 @@ class QuantumVelocityField(nn.Module):
         _kl = k_local
         _no = self.n_obs
         _qc = qvit_circuit
+        _nr = n_reupload
+
+        # Pre-compute enc_per_block for re-upload offset calculations
+        if encoding_type == "sun":
+            _n_even = n_qubits // 2
+            _n_odd = (n_qubits - 1) // 2
+            _epb = (_n_even + _n_odd) * 15
+        else:
+            _epb = n_qubits
 
         @qml.qnode(dev, interface="torch", diff_method="best")
         def _circuit(enc, vqc_p1, vqc_p2, H_mats):
-            # Stage 1: Encoding
-            if _et == "sun":
+
+            # ---- Helper: one QViT gate (shared by both paths) ----
+            def _qvit_gate(p, w1, w2):
+                qml.U3(p[0], p[1], p[2], wires=w1)
+                qml.IsingXX(p[3], wires=[w1, w2])
+                qml.IsingYY(p[4], wires=[w1, w2])
+                qml.IsingZZ(p[5], wires=[w1, w2])
+                qml.U3(p[6], p[7], p[8], wires=w1)
+                qml.IsingXX(p[9], wires=[w1, w2])
+                qml.IsingYY(p[10], wires=[w1, w2])
+                qml.IsingZZ(p[11], wires=[w1, w2])
+
+            # ---- Helper: one QViT depth layer ----
+            def _qvit_layer(params_ly):
+                pidx = 0
+                if _qc == "butterfly":
+                    n_layers = int(math.ceil(math.log2(_nq)))
+                    for layer in range(n_layers):
+                        stride = 2 ** layer
+                        for start in range(0, _nq - stride, 2 * stride):
+                            for offset in range(stride):
+                                w1 = start + offset
+                                w2 = start + offset + stride
+                                if w1 < _nq and w2 < _nq:
+                                    _qvit_gate(params_ly[pidx], w1, w2)
+                                    pidx += 1
+                elif _qc == "pyramid":
+                    for layer in range(_nq - 1):
+                        for i in range(_nq - layer - 1):
+                            _qvit_gate(params_ly[pidx], i, i + 1)
+                            pidx += 1
+                elif _qc == "x":
+                    for i in range(_nq // 2):
+                        w1, w2 = i, _nq - 1 - i
+                        _qvit_gate(params_ly[pidx], w1, w2)
+                        pidx += 1
+                    for i in range(_nq // 2 - 1):
+                        _qvit_gate(params_ly[pidx], i, i + 1)
+                        pidx += 1
+
+            # ---- Helper: one HWE depth layer ----
+            def _hwe_layer(params_ly):
+                for q in range(_nq):
+                    qml.RY(params_ly[q], wires=q)
+                for q in range(0, _nq - 1, 2):
+                    qml.CNOT(wires=[q, q + 1])
+                for q in range(1, _nq - 1, 2):
+                    qml.CNOT(wires=[q, q + 1])
+
+            # ---- Helper: one SU(N) encoding block ----
+            def _sun_encode_block(enc_slice):
                 idx = 0
-                for _ in range(_nb):
+                for q in range(0, _nq - 1, 2):
+                    qml.SpecialUnitary(enc_slice[..., idx:idx + 15],
+                                       wires=[q, q + 1])
+                    idx += 15
+                for q in range(1, _nq - 1, 2):
+                    qml.SpecialUnitary(enc_slice[..., idx:idx + 15],
+                                       wires=[q, q + 1])
+                    idx += 15
+
+            # ---- Helper: one angle encoding block ----
+            def _angle_encode_block(enc_slice, add_entangle=True):
+                for q in range(_nq):
+                    qml.RY(enc_slice[..., q], wires=q)
+                if add_entangle:
                     for q in range(0, _nq - 1, 2):
-                        qml.SpecialUnitary(enc[..., idx:idx + 15],
-                                           wires=[q, q + 1])
-                        idx += 15
+                        qml.CNOT(wires=[q, q + 1])
                     for q in range(1, _nq - 1, 2):
-                        qml.SpecialUnitary(enc[..., idx:idx + 15],
-                                           wires=[q, q + 1])
-                        idx += 15
-            else:  # angle
-                for layer in range(_nb):
-                    for q in range(_nq):
-                        qml.RY(enc[..., layer * _nq + q], wires=q)
-                    if layer < _nb - 1:
+                        qml.CNOT(wires=[q, q + 1])
+
+            # ==============================================================
+            # Re-upload path: L rounds of [1 encode block + 1 VQC layer]
+            # ==============================================================
+            if _nr > 1:
+                for r in range(_nr):
+                    # -- Encode round r --
+                    offset = r * _epb
+                    if _et == "sun":
+                        _sun_encode_block(enc[..., offset:offset + _epb])
+                    else:
+                        _angle_encode_block(
+                            enc[..., offset:offset + _nq],
+                            add_entangle=True)
+
+                    # -- VQC round r --
+                    if _vt == "qvit":
+                        _qvit_layer(vqc_p1[r])
+                    elif _vt == "hardware_efficient":
+                        _hwe_layer(vqc_p1[r])
+                    # (vqc_type=="none" -> skip VQC)
+
+            # ==============================================================
+            # Original path: n_blocks encode, then vqc_depth VQC (unchanged)
+            # ==============================================================
+            else:
+                # Stage 1: Encoding
+                if _et == "sun":
+                    idx = 0
+                    for _ in range(_nb):
                         for q in range(0, _nq - 1, 2):
-                            qml.CNOT(wires=[q, q + 1])
+                            qml.SpecialUnitary(enc[..., idx:idx + 15],
+                                               wires=[q, q + 1])
+                            idx += 15
                         for q in range(1, _nq - 1, 2):
-                            qml.CNOT(wires=[q, q + 1])
+                            qml.SpecialUnitary(enc[..., idx:idx + 15],
+                                               wires=[q, q + 1])
+                            idx += 15
+                else:  # angle
+                    for layer in range(_nb):
+                        for q in range(_nq):
+                            qml.RY(enc[..., layer * _nq + q], wires=q)
+                        if layer < _nb - 1:
+                            for q in range(0, _nq - 1, 2):
+                                qml.CNOT(wires=[q, q + 1])
+                            for q in range(1, _nq - 1, 2):
+                                qml.CNOT(wires=[q, q + 1])
 
-            # Stage 2: VQC
-            if _vt == "qcnn":
-                wires = list(range(_nq))
-                for ly in range(_vd):
-                    nw = len(wires)
-                    if nw < 2:
-                        break
-                    # Convolution
-                    for parity in [0, 1]:
+                # Stage 2: VQC
+                if _vt == "qcnn":
+                    wires = list(range(_nq))
+                    for ly in range(_vd):
+                        nw = len(wires)
+                        if nw < 2:
+                            break
+                        # Convolution
+                        for parity in [0, 1]:
+                            for i in range(len(wires)):
+                                if i % 2 == parity and i < nw - 1:
+                                    w1, w2 = wires[i], wires[i + 1]
+                                    qml.U3(*vqc_p1[ly, i, :3], wires=w1)
+                                    qml.U3(*vqc_p1[ly, i + 1, 3:6],
+                                            wires=w2)
+                                    qml.IsingZZ(vqc_p1[ly, i, 6],
+                                                wires=[w1, w2])
+                                    qml.IsingYY(vqc_p1[ly, i, 7],
+                                                wires=[w1, w2])
+                                    qml.IsingXX(vqc_p1[ly, i, 8],
+                                                wires=[w1, w2])
+                                    qml.U3(*vqc_p1[ly, i, 9:12], wires=w1)
+                                    qml.U3(*vqc_p1[ly, i + 1, 12:15],
+                                            wires=w2)
+                        # Pooling
                         for i in range(len(wires)):
-                            if i % 2 == parity and i < nw - 1:
-                                w1, w2 = wires[i], wires[i + 1]
-                                qml.U3(*vqc_p1[ly, i, :3], wires=w1)
-                                qml.U3(*vqc_p1[ly, i + 1, 3:6], wires=w2)
-                                qml.IsingZZ(vqc_p1[ly, i, 6],
-                                            wires=[w1, w2])
-                                qml.IsingYY(vqc_p1[ly, i, 7],
-                                            wires=[w1, w2])
-                                qml.IsingXX(vqc_p1[ly, i, 8],
-                                            wires=[w1, w2])
-                                qml.U3(*vqc_p1[ly, i, 9:12], wires=w1)
-                                qml.U3(*vqc_p1[ly, i + 1, 12:15], wires=w2)
-                    # Pooling
-                    for i in range(len(wires)):
-                        if i % 2 == 1 and i < nw:
-                            m = qml.measure(wires[i])
-                            qml.cond(m, qml.U3)(
-                                *vqc_p2[ly, i // 2],
-                                wires=wires[i - 1])
-                    wires = wires[::2]
+                            if i % 2 == 1 and i < nw:
+                                m = qml.measure(wires[i])
+                                qml.cond(m, qml.U3)(
+                                    *vqc_p2[ly, i // 2],
+                                    wires=wires[i - 1])
+                        wires = wires[::2]
 
-            elif _vt == "hardware_efficient":
-                for ly in range(_vd):
-                    for q in range(_nq):
-                        qml.RY(vqc_p1[ly, q], wires=q)
-                    for q in range(0, _nq - 1, 2):
-                        qml.CNOT(wires=[q, q + 1])
-                    for q in range(1, _nq - 1, 2):
-                        qml.CNOT(wires=[q, q + 1])
+                elif _vt == "hardware_efficient":
+                    for ly in range(_vd):
+                        _hwe_layer(vqc_p1[ly])
 
-            elif _vt == "qvit":
-                # Enhanced QViT layers: U3 + IsingXX/YY/ZZ
-                # Per gate pair: U3(w1) IsingXX/YY/ZZ(w1,w2) U3(w1) IsingXX/YY/ZZ(w1,w2)
-                # 12 params per gate: [U3(3), Ising(3), U3(3), Ising(3)]
-                def _qvit_gate(p, w1, w2):
-                    qml.U3(p[0], p[1], p[2], wires=w1)
-                    qml.IsingXX(p[3], wires=[w1, w2])
-                    qml.IsingYY(p[4], wires=[w1, w2])
-                    qml.IsingZZ(p[5], wires=[w1, w2])
-                    qml.U3(p[6], p[7], p[8], wires=w1)
-                    qml.IsingXX(p[9], wires=[w1, w2])
-                    qml.IsingYY(p[10], wires=[w1, w2])
-                    qml.IsingZZ(p[11], wires=[w1, w2])
+                elif _vt == "qvit":
+                    for ly in range(_vd):
+                        _qvit_layer(vqc_p1[ly])
 
-                for ly in range(_vd):
-                    pidx = 0
-                    if _qc == "butterfly":
-                        n_layers = int(math.ceil(math.log2(_nq)))
-                        for layer in range(n_layers):
-                            stride = 2 ** layer
-                            for start in range(0, _nq - stride, 2 * stride):
-                                for offset in range(stride):
-                                    w1 = start + offset
-                                    w2 = start + offset + stride
-                                    if w1 < _nq and w2 < _nq:
-                                        _qvit_gate(vqc_p1[ly, pidx], w1, w2)
-                                        pidx += 1
-                    elif _qc == "pyramid":
-                        for layer in range(_nq - 1):
-                            for i in range(_nq - layer - 1):
-                                _qvit_gate(vqc_p1[ly, pidx], i, i + 1)
-                                pidx += 1
-                    elif _qc == "x":
-                        for i in range(_nq // 2):
-                            w1, w2 = i, _nq - 1 - i
-                            _qvit_gate(vqc_p1[ly, pidx], w1, w2)
-                            pidx += 1
-                        for i in range(_nq // 2 - 1):
-                            _qvit_gate(vqc_p1[ly, pidx], i, i + 1)
-                            pidx += 1
-
-            # Stage 3: Measurement
+            # Stage 3: Measurement (always runs after all encoding/VQC)
             if _kl > 0:
                 return [qml.expval(qml.Hermitian(H_mats[w], wires=_wg[w]))
                         for w in range(_no)]
@@ -822,6 +907,8 @@ def build_velocity_field(args, device):
             vqc_type=args.vqc_type, vqc_depth=args.vqc_depth,
             k_local=args.k_local, obs_scheme=args.obs_scheme,
             qvit_circuit=args.qvit_circuit,
+            vel_head_hidden=args.vel_head_hidden,
+            n_reupload=args.n_reupload,
         ).to(device)
     return vf
 
@@ -1019,7 +1106,8 @@ def train_cfm(args, vae, train_loader, val_loader, device):
               f"{vf.total_enc} params")
         print(f"  VQC: {args.vqc_type}, depth={args.vqc_depth}")
         print(f"  ANO: k_local={args.k_local}, scheme={args.obs_scheme}, "
-              f"n_obs={vf.n_obs}")
+              f"n_obs={vf.n_obs}, ratio={vf.n_obs/args.latent_dim:.2f}, "
+              f"reupload={vf.n_reupload}")
     else:
         print(f"  Classical MLP: hidden_dims={args.mlp_hidden_dims}")
 
