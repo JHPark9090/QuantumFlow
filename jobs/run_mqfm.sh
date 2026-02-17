@@ -9,8 +9,8 @@
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=32
 #SBATCH --chdir='/pscratch/sd/j/junghoon/QuantumFlow'
-#SBATCH --output=/pscratch/sd/j/junghoon/QuantumFlow/run_mqfm.out
-#SBATCH -e /pscratch/sd/j/junghoon/QuantumFlow/run_mqfm.e
+#SBATCH --output=/pscratch/sd/j/junghoon/QuantumFlow/logs/run_mqfm.out
+#SBATCH -e /pscratch/sd/j/junghoon/QuantumFlow/logs/run_mqfm.e
 #SBATCH --mail-user=utopie9090@snu.ac.kr
 #!/bin/bash
 set +x

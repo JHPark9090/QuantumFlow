@@ -6,9 +6,9 @@
 #SBATCH -c 32
 #SBATCH --gpus-per-task=1
 #SBATCH -t 48:00:00
-#SBATCH -J qlcfm_cifar_qvit
-#SBATCH -o logs/qlcfm_cifar_qvit_%j.out
-#SBATCH -e logs/qlcfm_cifar_qvit_%j.err
+#SBATCH -J qlcfm_coco_v5
+#SBATCH -o logs/qlcfm_coco_v5_%j.out
+#SBATCH -e logs/qlcfm_coco_v5_%j.err
 
 export PYTHONNOUSERSITE=1
 eval "$(conda shell.bash hook 2>/dev/null)"
@@ -16,19 +16,20 @@ conda activate /pscratch/sd/j/junghoon/conda-envs/qml_eeg
 
 cd /pscratch/sd/j/junghoon/QuantumFlow
 
-python models/QuantumLatentCFM.py \
+python models/QuantumLatentCFM_v5.py \
     --phase=both \
-    --dataset=cifar10 \
-    --latent-dim=128 \
+    --dataset=coco \
+    --vae-arch=legacy \
+    --latent-dim=64 \
     --beta=0.5 \
+    --n-circuits=16 \
     --n-qubits=8 \
-    --n-blocks=2 \
     --encoding-type=sun \
     --vqc-type=qvit \
     --qvit-circuit=butterfly \
     --vqc-depth=2 \
     --k-local=2 \
-    --obs-scheme=sliding \
+    --obs-scheme=pairwise \
     --lr=1e-3 \
     --lr-H=1e-1 \
     --lr-vae=1e-3 \
@@ -39,4 +40,5 @@ python models/QuantumLatentCFM.py \
     --seed=2025 \
     --ode-steps=100 \
     --n-samples=64 \
-    --job-id=qlcfm_cifar_qvit_${SLURM_JOB_ID}
+    --compute-metrics \
+    --job-id=qlcfm_coco_v5_${SLURM_JOB_ID}
