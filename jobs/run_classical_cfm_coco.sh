@@ -7,8 +7,8 @@
 #SBATCH --gpus-per-task=1
 #SBATCH -t 48:00:00
 #SBATCH -J classical_cfm_coco
-#SBATCH -o logs/classical_cfm_coco_%j.out
-#SBATCH -e logs/classical_cfm_coco_%j.err
+#SBATCH -o /pscratch/sd/j/junghoon/QuantumFlow/logs/classical_cfm_coco_%j.out
+#SBATCH -e /pscratch/sd/j/junghoon/QuantumFlow/logs/classical_cfm_coco_%j.err
 
 export PYTHONNOUSERSITE=1
 eval "$(conda shell.bash hook 2>/dev/null)"

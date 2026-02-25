@@ -6,9 +6,9 @@
 #SBATCH -c 32
 #SBATCH --gpus-per-task=1
 #SBATCH -t 48:00:00
-#SBATCH -J qlcfm_cifar_qvit_v3_pw2
-#SBATCH -o /pscratch/sd/j/junghoon/QuantumFlow/logs/qlcfm_cifar_qvit_v3_pw2_%j.out
-#SBATCH -e /pscratch/sd/j/junghoon/QuantumFlow/logs/qlcfm_cifar_qvit_v3_pw2_%j.err
+#SBATCH -J classical_cfm_C
+#SBATCH -o /pscratch/sd/j/junghoon/QuantumFlow/logs/classical_cfm_C_%j.out
+#SBATCH -e /pscratch/sd/j/junghoon/QuantumFlow/logs/classical_cfm_C_%j.err
 
 export PYTHONNOUSERSITE=1
 eval "$(conda shell.bash hook 2>/dev/null)"
@@ -16,22 +16,20 @@ conda activate /pscratch/sd/j/junghoon/conda-envs/qml_eeg
 
 cd /pscratch/sd/j/junghoon/QuantumFlow
 
-python models/QuantumLatentCFM.py \
+# Classical-C: Same architecture as Classical-A but with time_embed_dim=32
+# Architecture: time_mlp(32) + MLP(64->256->256->256->32) with SiLU
+# Serves as the classical control for v6/v7 (all share time_embed_dim=32)
+
+python models/QuantumLatentCFM_v6.py \
     --phase=both \
     --dataset=cifar10 \
-    --vae-arch=legacy \
+    --vae-arch=resconv \
     --latent-dim=32 \
     --beta=0.5 \
-    --n-qubits=12 \
-    --n-blocks=2 \
-    --encoding-type=sun \
-    --vqc-type=qvit \
-    --qvit-circuit=butterfly \
-    --vqc-depth=2 \
-    --k-local=2 \
-    --obs-scheme=pairwise \
+    --velocity-field=classical \
+    --mlp-hidden-dims=256,256,256 \
+    --time-embed-dim=32 \
     --lr=1e-3 \
-    --lr-H=1e-1 \
     --lr-vae=1e-3 \
     --batch-size=32 \
     --epochs=200 \
@@ -41,4 +39,4 @@ python models/QuantumLatentCFM.py \
     --ode-steps=100 \
     --n-samples=64 \
     --compute-metrics \
-    --job-id=qlcfm_cifar_qvit_v3_pw2_${SLURM_JOB_ID}
+    --job-id=classical_cfm_C_${SLURM_JOB_ID}

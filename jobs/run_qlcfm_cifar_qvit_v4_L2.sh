@@ -7,8 +7,8 @@
 #SBATCH --gpus-per-task=1
 #SBATCH -t 48:00:00
 #SBATCH -J qlcfm_cifar_qvit_v4_L2
-#SBATCH -o logs/qlcfm_cifar_qvit_v4_L2_%j.out
-#SBATCH -e logs/qlcfm_cifar_qvit_v4_L2_%j.err
+#SBATCH -o /pscratch/sd/j/junghoon/QuantumFlow/logs/qlcfm_cifar_qvit_v4_L2_%j.out
+#SBATCH -e /pscratch/sd/j/junghoon/QuantumFlow/logs/qlcfm_cifar_qvit_v4_L2_%j.err
 
 export PYTHONNOUSERSITE=1
 eval "$(conda shell.bash hook 2>/dev/null)"
