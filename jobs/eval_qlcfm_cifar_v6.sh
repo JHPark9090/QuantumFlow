@@ -1,12 +1,11 @@
 #!/bin/bash
-#SBATCH -A m4807_g
-#SBATCH -C gpu&hbm80g
+#SBATCH -A m4807
+#SBATCH -C cpu
 #SBATCH -q shared
 #SBATCH -n 1
-#SBATCH -c 32
-#SBATCH --gpus-per-task=1
-#SBATCH -t 02:00:00
-#SBATCH -J eval_v6
+#SBATCH -c 64
+#SBATCH -t 06:00:00
+#SBATCH -J eval_v6_cpu
 #SBATCH -o /pscratch/sd/j/junghoon/QuantumFlow/logs/eval_v6_%j.out
 #SBATCH -e /pscratch/sd/j/junghoon/QuantumFlow/logs/eval_v6_%j.err
 
@@ -17,7 +16,7 @@ conda activate /pscratch/sd/j/junghoon/conda-envs/qml_eeg
 cd /pscratch/sd/j/junghoon/QuantumFlow
 
 # Recompute FID/IS for v6-Quantum with 50k eval samples
-python models/QuantumLatentCFM_v6.py \
+python -u models/QuantumLatentCFM_v6.py \
     --phase=generate \
     --dataset=cifar10 \
     --vae-arch=resconv \

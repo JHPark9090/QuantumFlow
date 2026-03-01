@@ -1046,7 +1046,7 @@ def train_vae(args, train_loader, val_loader, device):
     best_val, best_state = float("inf"), None
 
     if args.resume and os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, weights_only=False)
+        ckpt = torch.load(ckpt_path, weights_only=False, map_location=device)
         vae.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
@@ -1275,7 +1275,7 @@ def train_cfm(args, vae, train_loader, val_loader, device):
     best_val, best_state = float("inf"), None
 
     if args.resume and os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, weights_only=False)
+        ckpt = torch.load(ckpt_path, weights_only=False, map_location=device)
         vf.load_state_dict(ckpt["model"])
         circ_opt.load_state_dict(ckpt["circ_opt"])
         if H_opt and "H_opt" in ckpt:
@@ -1522,7 +1522,7 @@ def main():
                 print("  Run --phase=1 first or provide --vae-ckpt=<path>")
                 return
             vae = build_vae(args).to(device)
-            vae.load_state_dict(torch.load(vae_path, weights_only=True))
+            vae.load_state_dict(torch.load(vae_path, weights_only=True, map_location=device))
             print(f"  Loaded VAE from {vae_path}")
 
         vf = train_cfm(args, vae, train_loader, val_loader, device)
@@ -1558,10 +1558,10 @@ def main():
             return
 
         vae = build_vae(args).to(device)
-        vae.load_state_dict(torch.load(vae_path, weights_only=True))
+        vae.load_state_dict(torch.load(vae_path, weights_only=True, map_location=device))
 
         vf = build_velocity_field(args, device)
-        vf.load_state_dict(torch.load(cfm_path, weights_only=True))
+        vf.load_state_dict(torch.load(cfm_path, weights_only=True, map_location=device))
 
         img_path = os.path.join(args.base_path, "results",
                                 f"generated_{args.job_id}.png")

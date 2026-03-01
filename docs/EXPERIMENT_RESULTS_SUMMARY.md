@@ -29,9 +29,9 @@ Only models that completed all 200 CFM epochs and ran FID/IS evaluation are show
 | Classical-B | **244.22** | **2.33 +/- 0.13** | 0.315 |
 | Classical-C | 297.42 | 2.17 +/- 0.14 | 0.436 |
 | **v6 (1x8q)** | **287.43** | **2.34 +/- 0.19** | 0.485 |
-| v7 (8x8q) | — | — | 0.475* |
+| v7 (8x8q) | — | — | 0.462* |
 
-\* v7 at epoch 18/200, still running. Will require resume to complete.
+\* v7 completed 40/200 epochs before 48h wall-time cancellation. Will require resume to complete.
 
 **Note**: FID/IS computed with 1,024 samples (insufficient for publication; 10K-50K needed).
 CFM MSE is not comparable across different VAEs — see [Section 7](#7-known-confounds-in-v1-v5).
@@ -325,10 +325,10 @@ same time_embed_dim (32) with time_mlp, same data pipeline, same training loop.
 | vel_head | Linear(224,256) → SiLU → Linear(256,32) |
 | Input | Shared: concat(z_t[32], t_emb[32]) = 64 dims to ALL circuits |
 | VF params | 422,824 (circuit=419,240, ANO=3,584) |
-| CFM Val MSE | **0.475** (at epoch 18, still running) |
-| FID / IS | Pending |
-| Epochs completed | 18/200 (running, will need resume) |
-| Time/epoch | ~4,150s |
+| CFM Val MSE | **0.462** (at epoch 40, wall-time cancelled) |
+| FID / IS | Pending (needs resume + completion) |
+| Epochs completed | 40/200 (cancelled at 48h wall time, mid-epoch 41) |
+| Time/epoch | ~4,050s (early) → ~3,870s (later) |
 
 ---
 
@@ -365,7 +365,7 @@ solely to the velocity field.
 | 1 | Classical-A | — | 32 | 173K | — | **0.044** | 200 | 421.70 | 1.35 |
 | 2 | Classical-B | — | 256 | 288K | — | 0.315 | 200 | **244.22** | **2.33** |
 | 3 | Classical-C | — | 32 | 159K | — | 0.436 | 200 | 297.42 | 2.17 |
-| 4 | v7 (8x8q) | 8x8 | 32 | 423K | 7.00 | 0.475* | 18* | — | — |
+| 4 | v7 (8x8q) | 8x8 | 32 | 423K | 7.00 | 0.462* | 40* | — | — |
 | 5 | v6 (1x8q) | 1x8 | 32 | 62K | 0.88 | 0.485 | 200 | **287.43** | **2.34** |
 | 6 | v2 (12q) | 12 | 32 | 113K | 0.34 | 0.532 | 200 | — | — |
 | 7 | v4-L2 | 12 | 32 | 128K | 2.06 | 0.619 | 195 | — | — |
@@ -377,7 +377,7 @@ solely to the velocity field.
 | 13 | v1-QCNN | 8 | 128 | 155K | 0.05 | 0.961 | 200 | — | — |
 | 14 | v3-sl3 | 12 | 32 | 114K | 0.31 | 0.983 | 115 | — | — |
 
-\* v7 still running at epoch 18/200.
+\* v7 cancelled at 48h wall time after 40/200 epochs. Needs `--resume` to complete.
 
 ### Controlled comparison (v6 codebase, same VAE)
 
@@ -385,7 +385,7 @@ solely to the velocity field.
 |-------|-----------|---------|-----|-----|---------|
 | Classical-C | 158,560 | 0.436 | 297.42 | 2.17 | 5.9 |
 | **v6 (1x8q)** | 62,121 | 0.485 | **287.43** | **2.34** | 500 |
-| v7 (8x8q) | 422,824 | 0.475* | — | — | 4,150 |
+| v7 (8x8q) | 422,824 | 0.462* | — | — | ~4,000 |
 
 ---
 
@@ -449,7 +449,7 @@ Classical-A (MSE 0.044) appears far better than Classical-C (MSE 0.436), but:
 | v3-pw2 | 2.06 | 0.65 |
 | v3-pw3 | 6.88 | 0.69 |
 | v5 | 7.00 | 0.84 |
-| v7 | 7.00 | 0.48* |
+| v7 | 7.00 | 0.46* |
 
 v5 (ratio 7.0, split input) was worst; v7 (ratio 7.0, shared input) is best.
 Architecture quality (nonlinear layers, shared input, time conditioning) dominates
@@ -468,9 +468,21 @@ The v6 codebase eliminates 7 confounding variables from v1-v5:
 
 ### Finding 5: v7 converges faster per epoch than v6
 
-At epoch 18, v7 (val MSE 0.475) already surpasses v6's final result (val MSE 0.485).
-However, v7 is 8.3x slower per epoch (4,150s vs 500s), so wall-clock efficiency is
-lower. v7 needs resume to complete full 200 epochs (estimated 8.8 days total).
+By epoch 40, v7 (val MSE 0.462) surpasses v6's final 200-epoch result (val MSE 0.485)
+by a significant margin, and the loss curve was still declining when the job was
+cancelled at the 48h wall-time limit. However, v7 is ~8x slower per epoch (~4,000s
+vs ~500s), so wall-clock efficiency is lower. v7 needs `--resume` to complete the
+remaining 160 epochs (estimated ~7 additional days of compute).
+
+**v7 convergence trajectory (selected epochs):**
+
+| Epoch | Train MSE | Val MSE | Eig Range |
+|-------|-----------|---------|-----------|
+| 1 | 0.616 | 0.569 | [-13, 13] |
+| 10 | 0.487 | 0.485 | [-21, 20] |
+| 20 | 0.476 | 0.479 | [-25, 23] |
+| 30 | 0.473 | 0.471 | [-24, 26] |
+| 40 | 0.470 | 0.462 | [-23, 31] |
 
 ---
 
