@@ -1,31 +1,32 @@
 """
-VAE v3 — SOTA Architecture with GroupNorm, SiLU, Self-Attention, Adversarial Training
-=======================================================================================
+VAE v5 -- Bottleneck Fix: Stop at 4x4, 1x1 Conv Channel Reduction
+===================================================================
 
-Upgrades over VAE v2:
-  1. GroupNorm(32) + SiLU instead of BatchNorm + ReLU
-  2. Wider channels: 128->256->512->512 (was 32->64->128->256)
-  3. Self-attention at 8x8 and 4x4 spatial resolutions
-  4. Tanh output [-1,1] instead of Sigmoid [0,1]
-  5. L1 reconstruction loss (sharper than MSE)
-  6. LPIPS perceptual loss (replaces VGG L1)
-  7. PatchGAN discriminator with hinge loss (2-stage training)
-  8. EMA weight averaging (decay=0.999)
-  9. ~10M params (was ~2.1M)
+Same architecture as v3 (ResConvVAE with GroupNorm+SiLU+SelfAttention) but fixes
+the two stacked bottlenecks that capped v3/v4 at PSNR ~19.5 dB:
 
-Training schedule:
-  - Stage 1 (warmup, epochs 1-N_warmup): L1 + beta*KL + LPIPS, no discriminator
-  - Stage 2 (adversarial, epochs N_warmup+1 to end): add PatchGAN hinge loss
+  1. REMOVED: Final stride-2 downsample from 4x4 -> 2x2
+  2. REPLACED: Flatten(1024) -> Linear(1024, 64) [16:1 compression]
+     WITH:    Conv1x1(256, C_z) at 4x4 -> Flatten(C_z*16) -> Linear(C_z*16, 64)
+     Default C_z=4: pre-flatten=64 dims -> Linear(64,64) = 1:1 (no compression)
+
+Decoder mirrors: Linear(64, C_z*16) -> reshape(C_z,4,4) -> Conv1x1(C_z,256) -> ...
+
+Everything else is identical to v3: GroupNorm(32)+SiLU ResBlocks, SelfAttention at
+8x8 and 4x4, Tanh [-1,1] output, L1 recon, LPIPS, PatchGAN, EMA, free_bits KL.
 
 Usage:
   # Quick test
-  python models/train_vae_v3.py --dataset=cifar10 --n-epochs=5 \\
-      --n-train=1000 --n-valtest=200 --job-id=test
+  python models/train_vae_v5.py --dataset=cifar10 --n-epochs=5 \\
+      --n-train=1000 --n-valtest=200 --job-id=test_v5
 
-  # Full training (300 epochs, adversarial from epoch 51)
-  python models/train_vae_v3.py --dataset=cifar10 --latent-dim=64 \\
-      --n-epochs=300 --adversarial-start-epoch=51 --lambda-adv=0.1 \\
-      --seed=2025 --compute-recon-fid --job-id=vae_v3_cifar_${SLURM_JOB_ID}
+  # Full training (300 epochs)
+  python models/train_vae_v5.py --dataset=cifar10 --latent-dim=64 --c-z=4 \\
+      --n-epochs=300 --adversarial-start-epoch=51 \\
+      --seed=2025 --compute-recon-fid --job-id=vae_v5_cifar_${SLURM_JOB_ID}
+
+References:
+  - VAE_BOTTLENECK_DIAGNOSIS.md for detailed analysis of the v3/v4 bottleneck
 """
 
 import argparse
@@ -52,13 +53,16 @@ DATA_ROOT = "/pscratch/sd/j/junghoon/data"
 # 1. Argparse
 # ---------------------------------------------------------------------------
 def get_args():
-    p = argparse.ArgumentParser(description="VAE v3 — SOTA Architecture Training")
+    p = argparse.ArgumentParser(description="VAE v5 -- Bottleneck Fix")
 
     p.add_argument("--dataset", type=str, default="cifar10",
                    choices=["cifar10", "mnist", "fashion"],
                    help="Dataset to train on")
     p.add_argument("--latent-dim", type=int, default=64,
                    help="VAE latent dimension")
+    p.add_argument("--c-z", type=int, default=4,
+                   help="Channel count after 1x1 conv at 4x4 "
+                        "(pre-flatten = c_z * 16)")
 
     # Loss weights
     p.add_argument("--beta", type=float, default=0.001,
@@ -69,8 +73,11 @@ def get_args():
                    help="LPIPS perceptual loss weight")
     p.add_argument("--lambda-adv", type=float, default=0.1,
                    help="Adversarial loss weight (generator)")
-    p.add_argument("--adaptive-adv-weight", action="store_true",
-                   help="VQGAN-style adaptive adversarial weighting")
+    p.add_argument("--adaptive-adv-weight", action="store_true", default=True,
+                   help="VQGAN-style adaptive adversarial weighting (default: on)")
+    p.add_argument("--no-adaptive-adv-weight", action="store_false",
+                   dest="adaptive_adv_weight",
+                   help="Disable adaptive adversarial weighting")
     p.add_argument("--free-bits", type=float, default=0.25,
                    help="Minimum KL per latent dimension in nats")
     p.add_argument("--r1-gamma", type=float, default=10.0,
@@ -83,11 +90,15 @@ def get_args():
     # Adversarial training
     p.add_argument("--adversarial-start-epoch", type=int, default=51,
                    help="Epoch to start adversarial training (1-indexed)")
+    p.add_argument("--disc-warmup-epochs", type=int, default=5,
+                   help="Train D alone before adding adv loss to G")
+    p.add_argument("--disc-ramp-epochs", type=int, default=20,
+                   help="Linearly ramp adversarial weight over this many epochs")
 
     # Training
     p.add_argument("--lr", type=float, default=1e-4,
                    help="Generator (VAE) learning rate")
-    p.add_argument("--lr-disc", type=float, default=4e-4,
+    p.add_argument("--lr-disc", type=float, default=2e-4,
                    help="Discriminator learning rate")
     p.add_argument("--n-epochs", type=int, default=300)
     p.add_argument("--batch-size", type=int, default=64)
@@ -101,7 +112,7 @@ def get_args():
     p.add_argument("--seed", type=int, default=2025)
 
     # I/O
-    p.add_argument("--job-id", type=str, default="vae_v3_001")
+    p.add_argument("--job-id", type=str, default="vae_v5_001")
     p.add_argument("--base-path", type=str, default=".")
     p.add_argument("--resume", action="store_true")
 
@@ -142,7 +153,6 @@ def load_cifar_2d(seed, n_train, n_valtest, batch_size, img_size=32):
                              align_corners=False)
         X_te = F.interpolate(X_te, size=(img_size, img_size), mode="bilinear",
                              align_corners=False)
-    # Scale to [-1, 1]
     X_tr = X_tr * 2.0 - 1.0
     X_te = X_te * 2.0 - 1.0
     X_tr = X_tr[torch.randperm(len(X_tr))[:n_train]]
@@ -200,7 +210,7 @@ def _make_gen_loaders(X_train, X_valtest, batch_size):
 
 
 # ---------------------------------------------------------------------------
-# 4. Model Architecture — ResConvVAE_v3
+# 4. Model Architecture -- ResConvVAE_v5 (bottleneck fix)
 # ---------------------------------------------------------------------------
 class ResBlock_v3(nn.Module):
     """GroupNorm(32) -> SiLU -> Conv3x3 -> GroupNorm(32) -> SiLU -> Conv3x3 + skip."""
@@ -241,25 +251,29 @@ class SelfAttention(nn.Module):
         q = self.q(h).view(B, C, H * W)
         k = self.k(h).view(B, C, H * W)
         v = self.v(h).view(B, C, H * W)
-        attn = torch.bmm(q.transpose(1, 2), k) * self.scale  # (B, HW, HW)
+        attn = torch.bmm(q.transpose(1, 2), k) * self.scale
         attn = F.softmax(attn, dim=-1)
-        out = torch.bmm(v, attn.transpose(1, 2))  # (B, C, HW)
+        out = torch.bmm(v, attn.transpose(1, 2))
         out = out.view(B, C, H, W)
         return x + self.proj(out)
 
 
-class ResConvVAE_v3(nn.Module):
-    """SOTA VAE: GroupNorm+SiLU, 64->128->256->256 channels, self-attention, Tanh output.
+class ResConvVAE_v5(nn.Module):
+    """VAE v5: Stops at 4x4, uses 1x1 conv for channel reduction.
 
-    ~10M params. Encoder: 32x32 -> 2x2 -> flat -> latent.
-    Decoder: latent -> 2x2 -> 32x32. Output range [-1, 1].
+    Encoder: 32x32 -> 16x16 -> 8x8 -> 4x4 -> Conv1x1(256, c_z) -> flatten -> latent
+    Decoder: latent -> reshape(c_z, 4, 4) -> Conv1x1(c_z, 256) -> 8x8 -> 16x16 -> 32x32
+
+    With c_z=4 and latent_dim=64: pre-flatten = 4*4*4 = 64, so fc_mu is Linear(64,64)
+    — essentially a learned rotation, NOT a destructive 16:1 compression like v3/v4.
     """
 
-    def __init__(self, latent_dim=64, in_channels=3):
+    def __init__(self, latent_dim=64, in_channels=3, c_z=4):
         super().__init__()
         self.latent_dim = latent_dim
+        self.c_z = c_z
 
-        # Encoder: 32x32 -> 16x16 -> 8x8 -> 4x4 -> 2x2
+        # Encoder: 32x32 -> 16x16 -> 8x8 -> 4x4 (3 downsamples, NOT 4)
         self.encoder = nn.Sequential(
             nn.Conv2d(in_channels, 64, 3, 1, 1, bias=False),        # 32x32
             ResBlock_v3(64), ResBlock_v3(64),                        # 32x32
@@ -272,16 +286,17 @@ class ResConvVAE_v3(nn.Module):
             ResBlock_v3(256), ResBlock_v3(256),                      # 4x4
             SelfAttention(256),                                      # 4x4
             nn.GroupNorm(32, 256), nn.SiLU(inplace=True),
-            nn.Conv2d(256, 256, 3, 2, 1, bias=False),               # 2x2
+            nn.Conv2d(256, c_z, 1, bias=False),                     # 4x4, c_z channels
         )
-        flat_dim = 256 * 2 * 2  # 1024
+
+        flat_dim = c_z * 4 * 4  # e.g., 4 * 16 = 64
         self.fc_mu = nn.Linear(flat_dim, latent_dim)
         self.fc_logvar = nn.Linear(flat_dim, latent_dim)
 
-        # Decoder: 2x2 -> 4x4 -> 8x8 -> 16x16 -> 32x32
+        # Decoder: latent -> (c_z, 4, 4) -> (256, 4x4) -> 8x8 -> 16x16 -> 32x32
         self.fc_dec = nn.Linear(latent_dim, flat_dim)
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 256, 4, 2, 1, bias=False),      # 4x4
+            nn.Conv2d(c_z, 256, 1, bias=False),                     # 4x4, expand channels
             ResBlock_v3(256), ResBlock_v3(256),
             SelfAttention(256),                                      # 4x4
             nn.ConvTranspose2d(256, 256, 4, 2, 1, bias=False),      # 8x8
@@ -297,7 +312,7 @@ class ResConvVAE_v3(nn.Module):
         )
 
     def encode(self, x):
-        h = self.encoder(x).view(x.size(0), -1)
+        h = self.encoder(x).view(x.size(0), -1)  # (B, c_z*4*4)
         mu = self.fc_mu(h)
         logvar = torch.clamp(self.fc_logvar(h), -20, 2)
         return mu, logvar
@@ -307,7 +322,7 @@ class ResConvVAE_v3(nn.Module):
         return mu + std * torch.randn_like(std)
 
     def decode(self, z):
-        h = F.silu(self.fc_dec(z)).view(-1, 256, 2, 2)
+        h = F.silu(self.fc_dec(z)).view(-1, self.c_z, 4, 4)
         return self.decoder(h)
 
     def forward(self, x):
@@ -317,48 +332,42 @@ class ResConvVAE_v3(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 5. PatchGAN Discriminator
+# 5. PatchGAN Discriminator (v4 style: spectral norm, logistic loss)
 # ---------------------------------------------------------------------------
-class PatchGANDiscriminator(nn.Module):
-    """PatchGAN discriminator with hinge loss (~2.5M params).
+class PatchGANDiscriminator_v2(nn.Module):
+    """Enlarged PatchGAN with spectral normalization (~1.85M params)."""
 
-    Input: (B, 3, 32, 32) -> output: (B, 1, 3, 3) patch predictions.
-    """
-
-    def __init__(self, in_channels=3):
+    def __init__(self, in_channels=3, ndf=64):
         super().__init__()
+        from torch.nn.utils import spectral_norm
         self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 4, 2, 1),                    # 16x16
+            spectral_norm(nn.Conv2d(in_channels, ndf, 4, 2, 1)),      # 16x16
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, 4, 2, 1, bias=False),                # 8x8
-            nn.GroupNorm(32, 128),
+            spectral_norm(nn.Conv2d(ndf, ndf * 2, 4, 2, 1)),          # 8x8
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 256, 4, 2, 1, bias=False),               # 4x4
-            nn.GroupNorm(32, 256),
+            spectral_norm(nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1)),      # 4x4
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 1, 4, 1, 1),                             # 3x3
+            spectral_norm(nn.Conv2d(ndf * 4, ndf * 8, 4, 1, 1)),      # 3x3
+            nn.LeakyReLU(0.2, inplace=True),
+            spectral_norm(nn.Conv2d(ndf * 8, 1, 4, 1, 1)),            # 2x2
         )
 
     def forward(self, x):
         return self.net(x)
 
 
-def hinge_loss_disc(real_pred, fake_pred):
-    """Discriminator hinge loss."""
-    return (F.relu(1.0 - real_pred).mean() + F.relu(1.0 + fake_pred).mean())
+def disc_loss_logistic(real_pred, fake_pred):
+    """Non-saturating logistic loss for discriminator (no dead zone)."""
+    return F.softplus(-real_pred).mean() + F.softplus(fake_pred).mean()
 
 
-def hinge_loss_gen(fake_pred):
-    """Generator hinge loss."""
-    return -fake_pred.mean()
+def gen_loss_logistic(fake_pred):
+    """Non-saturating logistic loss for generator."""
+    return F.softplus(-fake_pred).mean()
 
 
 def r1_gradient_penalty(disc, real_images):
-    """R1 gradient penalty (Mescheder et al., 2018 / StyleGAN2).
-
-    Penalizes ||grad D(x_real)||^2 to prevent discriminator from
-    becoming overconfident. Returns scalar penalty (before gamma scaling).
-    """
+    """R1 gradient penalty (Mescheder et al., 2018 / StyleGAN2)."""
     real_images = real_images.detach().requires_grad_(True)
     real_pred = disc(real_images)
     grad_real = torch.autograd.grad(
@@ -368,11 +377,7 @@ def r1_gradient_penalty(disc, real_images):
 
 
 def compute_adaptive_adv_weight(recon_loss, adv_loss, last_layer_weight):
-    """VQGAN-style adaptive adversarial weight (Esser et al., 2021).
-
-    Balances gradient magnitudes: lambda = ||grad_recon|| / ||grad_adv||
-    so neither loss dominates.
-    """
+    """VQGAN-style adaptive adversarial weight (Esser et al., 2021)."""
     recon_grads = torch.autograd.grad(
         recon_loss, last_layer_weight, retain_graph=True)[0]
     adv_grads = torch.autograd.grad(
@@ -409,7 +414,7 @@ class EMAModel:
 
 
 # ---------------------------------------------------------------------------
-# 7. KL Computation (same as v2)
+# 7. KL Computation
 # ---------------------------------------------------------------------------
 def compute_kl(mu, logvar, free_bits=0.25):
     """KL with free bits: sum over latent dims, mean over batch."""
@@ -436,7 +441,6 @@ def save_recon_grid(vae, val_loader, device, save_path, n_images=8):
             x_hat, _, _ = vae(xb)
             break
 
-    # Convert from [-1,1] to [0,1] for display
     xb_disp = (xb.clamp(-1, 1) + 1) / 2
     xh_disp = (x_hat.clamp(-1, 1) + 1) / 2
 
@@ -475,7 +479,6 @@ def compute_recon_fid(vae, test_loader, device):
         for (xb,) in tqdm(test_loader, desc="Recon FID", leave=False):
             xb = xb.to(device)
             x_hat, _, _ = vae(xb)
-            # FID expects [0,1]
             xb_01 = (xb.clamp(-1, 1) + 1) / 2
             xh_01 = (x_hat.clamp(-1, 1) + 1) / 2
             fid.update(xb_01, real=True)
@@ -502,25 +505,27 @@ def train_vae(args):
     print(f"Data: {args.dataset} | train={args.n_train} val+test={args.n_valtest}")
     print(f"Data range: [-1, 1] (Tanh output)")
 
-    # VAE
-    vae = ResConvVAE_v3(latent_dim=args.latent_dim).to(device)
+    # VAE v5
+    vae = ResConvVAE_v5(latent_dim=args.latent_dim, c_z=args.c_z).to(device)
     total_p = sum(p.numel() for p in vae.parameters() if p.requires_grad)
-    print(f"VAE v3 | params={total_p:,} | latent_dim={args.latent_dim}")
+    flat_dim = args.c_z * 4 * 4
+    print(f"VAE v5 | params={total_p:,} | latent_dim={args.latent_dim} | "
+          f"c_z={args.c_z} | pre-flatten={flat_dim} | "
+          f"FC ratio={flat_dim}:{args.latent_dim} = "
+          f"{flat_dim / args.latent_dim:.1f}:1")
 
-    # Discriminator
-    disc = PatchGANDiscriminator().to(device)
+    # Discriminator (v4 style: spectral norm + logistic loss)
+    disc = PatchGANDiscriminator_v2().to(device)
     disc_p = sum(p.numel() for p in disc.parameters() if p.requires_grad)
-    print(f"Discriminator | params={disc_p:,}")
+    print(f"Discriminator v2 | params={disc_p:,} (spectral norm, logistic loss)")
 
-    # Optimizers (lower LR, (0.5, 0.9) betas for adversarial stability)
-    opt_g = torch.optim.Adam(vae.parameters(), lr=args.lr,
-                             betas=(0.5, 0.9))
+    # Optimizers
+    opt_g = torch.optim.Adam(vae.parameters(), lr=args.lr, betas=(0.5, 0.9))
     opt_d = torch.optim.Adam(disc.parameters(), lr=args.lr_disc,
-                             betas=(0.5, 0.9))
+                             betas=(0.0, 0.99))
     sched_g = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt_g, T_max=args.n_epochs, eta_min=1e-6)
-    sched_d = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt_d, T_max=args.n_epochs, eta_min=1e-6)
+    # Constant LR for discriminator (no cosine decay)
 
     # LPIPS perceptual loss
     lpips_fn = None
@@ -539,7 +544,7 @@ def train_vae(args):
     from torchmetrics.image import (StructuralSimilarityIndexMeasure,
                                     PeakSignalNoiseRatio)
     from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-    psnr_metric = PeakSignalNoiseRatio(data_range=2.0).to(device)  # [-1,1] range=2
+    psnr_metric = PeakSignalNoiseRatio(data_range=2.0).to(device)
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=2.0).to(device)
     lpips_eval = LearnedPerceptualImagePatchSimilarity(
         net_type="squeeze", normalize=False).to(device)
@@ -550,15 +555,21 @@ def train_vae(args):
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
 
-    ckpt_path = os.path.join(ckpt_dir, f"ckpt_vae_v3_{args.dataset}_{args.job_id}.pt")
-    weights_path = os.path.join(ckpt_dir, f"weights_vae_v3_{args.dataset}_{args.job_id}.pt")
-    ema_weights_path = os.path.join(ckpt_dir, f"weights_vae_v3_ema_{args.dataset}_{args.job_id}.pt")
-    csv_path = os.path.join(results_dir, f"log_vae_v3_{args.dataset}_{args.job_id}.csv")
-    metrics_path = os.path.join(results_dir, f"metrics_vae_v3_{args.dataset}_{args.job_id}.json")
+    ckpt_path = os.path.join(ckpt_dir,
+                             f"ckpt_vae_v5_{args.dataset}_{args.job_id}.pt")
+    weights_path = os.path.join(ckpt_dir,
+                                f"weights_vae_v5_{args.dataset}_{args.job_id}.pt")
+    ema_weights_path = os.path.join(
+        ckpt_dir, f"weights_vae_v5_ema_{args.dataset}_{args.job_id}.pt")
+    csv_path = os.path.join(results_dir,
+                            f"log_vae_v5_{args.dataset}_{args.job_id}.csv")
+    metrics_path = os.path.join(results_dir,
+                                f"metrics_vae_v5_{args.dataset}_{args.job_id}.json")
 
     fields = [
         "epoch", "train_loss_g", "train_recon", "train_kl", "train_lpips",
         "train_adv_g", "train_adv_weight", "train_loss_d", "train_r1",
+        "d_real_mean", "d_fake_mean", "d_real_std", "d_fake_std", "disc_factor",
         "val_loss", "val_recon", "val_kl", "val_lpips",
         "val_psnr", "val_ssim", "val_lpips_eval",
         "kl_mean_per_dim", "kl_min_per_dim", "kl_max_per_dim",
@@ -569,15 +580,21 @@ def train_vae(args):
     # Get decoder's last conv layer weight for adaptive adversarial weight
     dec_last_layer = vae.decoder[-2].weight  # Conv2d(64, 3, 3x3) before Tanh
 
-    print(f"\n--- VAE v3 Config ---")
+    print(f"\n--- VAE v5 Config ---")
+    print(f"  BOTTLENECK FIX: encoder stops at 4x4, "
+          f"Conv1x1(256->{args.c_z}) -> flatten({flat_dim}) -> "
+          f"Linear({flat_dim},{args.latent_dim})")
     print(f"  beta={args.beta}, free_bits={args.free_bits}")
-    print(f"  lambda_lpips={args.lambda_lpips} (every {args.lpips_every} batches)")
+    print(f"  lambda_lpips={args.lambda_lpips}")
     print(f"  lambda_adv={args.lambda_adv} (from epoch {args.adversarial_start_epoch})")
     print(f"  adaptive_adv_weight={args.adaptive_adv_weight}")
+    print(f"  D warmup={args.disc_warmup_epochs} epochs, "
+          f"ramp={args.disc_ramp_epochs} epochs")
+    print(f"  D: spectral norm, logistic loss, "
+          f"lr={args.lr_disc}, betas=(0.0, 0.99), constant LR")
     print(f"  R1 penalty: gamma={args.r1_gamma}, every {args.r1_every} batches")
-    print(f"  lr_g={args.lr}, lr_d={args.lr_disc}, betas=(0.5, 0.9)")
+    print(f"  G: lr={args.lr}, betas=(0.5, 0.9), cosine LR")
     print(f"  EMA decay={args.ema_decay}")
-    print(f"  Output: Tanh [-1, 1], recon loss: L1")
     print(f"---------------------\n")
 
     # Resume
@@ -593,8 +610,6 @@ def train_vae(args):
         opt_d.load_state_dict(ckpt["opt_d"])
         if "sched_g" in ckpt:
             sched_g.load_state_dict(ckpt["sched_g"])
-        if "sched_d" in ckpt:
-            sched_d.load_state_dict(ckpt["sched_d"])
         if "ema" in ckpt:
             ema.load_state_dict(ckpt["ema"])
         start_epoch = ckpt["epoch"] + 1
@@ -604,20 +619,6 @@ def train_vae(args):
     if start_epoch == 0:
         with open(csv_path, "w", newline="") as f:
             csv.DictWriter(f, fields).writeheader()
-    elif os.path.exists(csv_path):
-        # Migrate CSV if header changed (e.g., new columns added)
-        with open(csv_path, "r") as f:
-            reader = csv.reader(f)
-            old_header = next(reader, None)
-        if old_header and old_header != fields:
-            print(f"  CSV header mismatch — migrating to new schema")
-            with open(csv_path, "r") as f:
-                old_rows = list(csv.DictReader(f))
-            with open(csv_path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fields, restval="")
-                writer.writeheader()
-                for r in old_rows:
-                    writer.writerow(r)
 
     warmup = max(args.beta_warmup_epochs, 1)
 
@@ -628,16 +629,30 @@ def train_vae(args):
         lr_g = opt_g.param_groups[0]["lr"]
         lr_d = opt_d.param_groups[0]["lr"]
 
+        # Discriminator ramp factor
+        disc_factor = 0.0
+        if adv_active:
+            adv_epoch = (epoch + 1) - args.adversarial_start_epoch
+            if adv_epoch < args.disc_warmup_epochs:
+                disc_factor = 0.0  # D trains, but G doesn't see adv loss
+            elif adv_epoch < args.disc_warmup_epochs + args.disc_ramp_epochs:
+                ramp_ep = adv_epoch - args.disc_warmup_epochs
+                disc_factor = ramp_ep / args.disc_ramp_epochs
+            else:
+                disc_factor = 1.0
+
         # -- Train --
         vae.train()
         disc.train()
         tr_lg, tr_rec, tr_kl, tr_lp = 0., 0., 0., 0.
         tr_adv, tr_adv_w, tr_ld, tr_r1 = 0., 0., 0., 0.
+        tr_d_real_m, tr_d_fake_m = 0., 0.
+        tr_d_real_s, tr_d_fake_s = 0., 0.
         tr_n = 0
         batch_idx = 0
 
         for (xb,) in tqdm(train_loader,
-                          desc=f"VAE-v3 Ep {epoch+1}/{args.n_epochs}",
+                          desc=f"VAE-v5 Ep {epoch+1}/{args.n_epochs}",
                           leave=False):
             xb = xb.to(device)
             bs = xb.size(0)
@@ -650,27 +665,26 @@ def train_vae(args):
             kl, _ = compute_kl(mu, logvar, free_bits=args.free_bits)
             nll_loss = recon + beta_eff * kl
 
-            # LPIPS (expects [-1, 1] input) — compute every N batches
             lpips_val = 0.0
             if lpips_fn is not None and batch_idx % args.lpips_every == 0:
                 lp = lpips_fn(x_hat.clamp(-1, 1), xb)
                 nll_loss = nll_loss + args.lambda_lpips * lp
                 lpips_val = lp.item()
 
-            # Adversarial (generator) with adaptive weight
+            # Adversarial (generator)
             adv_g_val = 0.0
             adv_w_val = args.lambda_adv
-            if adv_active:
+            if adv_active and disc_factor > 0:
                 fake_pred = disc(x_hat)
-                adv_g = hinge_loss_gen(fake_pred)
+                adv_g = gen_loss_logistic(fake_pred)
 
                 if args.adaptive_adv_weight:
                     adv_w = compute_adaptive_adv_weight(
                         nll_loss, adv_g, dec_last_layer)
                     adv_w_val = adv_w.item()
-                    loss_g = nll_loss + adv_w * adv_g
+                    loss_g = nll_loss + disc_factor * adv_w * adv_g
                 else:
-                    loss_g = nll_loss + args.lambda_adv * adv_g
+                    loss_g = nll_loss + disc_factor * args.lambda_adv * adv_g
                 adv_g_val = adv_g.item()
             else:
                 loss_g = nll_loss
@@ -682,13 +696,19 @@ def train_vae(args):
             # --- Discriminator step ---
             loss_d_val = 0.0
             r1_val = 0.0
+            d_real_m, d_fake_m, d_real_s, d_fake_s = 0., 0., 0., 0.
             if adv_active:
                 x_hat_det = x_hat.detach()
                 real_pred = disc(xb)
                 fake_pred = disc(x_hat_det)
-                loss_d = hinge_loss_disc(real_pred, fake_pred)
+                loss_d = disc_loss_logistic(real_pred, fake_pred)
 
-                # R1 gradient penalty (lazy regularization)
+                # Diagnostics
+                d_real_m = real_pred.mean().item()
+                d_fake_m = fake_pred.mean().item()
+                d_real_s = real_pred.std().item()
+                d_fake_s = fake_pred.std().item()
+
                 if args.r1_gamma > 0 and batch_idx % args.r1_every == 0:
                     r1 = r1_gradient_penalty(disc, xb)
                     loss_d = loss_d + (args.r1_gamma / 2) * r1 * args.r1_every
@@ -710,6 +730,10 @@ def train_vae(args):
             tr_adv_w += adv_w_val * bs
             tr_ld += loss_d_val * bs
             tr_r1 += r1_val * bs
+            tr_d_real_m += d_real_m * bs
+            tr_d_fake_m += d_fake_m * bs
+            tr_d_real_s += d_real_s * bs
+            tr_d_fake_s += d_fake_s * bs
             tr_n += bs
 
         tr_lg /= tr_n
@@ -720,9 +744,12 @@ def train_vae(args):
         tr_adv_w /= tr_n
         tr_ld /= tr_n
         tr_r1 /= tr_n
+        tr_d_real_m /= tr_n
+        tr_d_fake_m /= tr_n
+        tr_d_real_s /= tr_n
+        tr_d_fake_s /= tr_n
 
         # -- Val (using EMA weights) --
-        # Save current weights, load EMA for eval
         orig_state = copy.deepcopy(vae.state_dict())
         ema.apply(vae)
         vae.eval()
@@ -753,11 +780,9 @@ def train_vae(args):
                 all_kl_per_dim.append(kl_per_dim_avg.cpu())
                 all_mu_norms.append(mu.norm(dim=1).mean().item())
 
-                # Metrics (data range [-1, 1])
                 x_hat_c = x_hat.clamp(-1, 1)
                 psnr_metric.update(x_hat_c, xb)
                 ssim_metric.update(x_hat_c, xb)
-                # LPIPS eval expects [-1, 1] unnormalized
                 lpips_eval.update(x_hat_c, xb)
 
                 bs = xb.size(0)
@@ -796,6 +821,11 @@ def train_vae(args):
             train_adv_weight=f"{tr_adv_w:.6f}",
             train_loss_d=f"{tr_ld:.6f}",
             train_r1=f"{tr_r1:.6f}",
+            d_real_mean=f"{tr_d_real_m:.6f}",
+            d_fake_mean=f"{tr_d_fake_m:.6f}",
+            d_real_std=f"{tr_d_real_s:.6f}",
+            d_fake_std=f"{tr_d_fake_s:.6f}",
+            disc_factor=f"{disc_factor:.4f}",
             val_loss=f"{vl_loss:.6f}",
             val_recon=f"{vl_rec:.6f}",
             val_kl=f"{vl_kl:.6f}",
@@ -819,9 +849,9 @@ def train_vae(args):
 
         adv_str = ""
         if adv_active:
-            adv_str = f" adv_g={tr_adv:.4f} D={tr_ld:.4f} w={tr_adv_w:.3f}"
-            if args.r1_gamma > 0:
-                adv_str += f" r1={tr_r1:.4f}"
+            adv_str = (f" adv_g={tr_adv:.4f} D={tr_ld:.4f} w={tr_adv_w:.3f}"
+                       f" df={disc_factor:.2f}"
+                       f" D(r)={tr_d_real_m:.3f} D(f)={tr_d_fake_m:.3f}")
         print(
             f"  Ep {epoch+1:3d} | "
             f"Train {tr_lg:.4f} (L1={tr_rec:.4f} kl={tr_kl:.4f} "
@@ -835,7 +865,7 @@ def train_vae(args):
         # Best model by PSNR (using EMA weights)
         if vl_psnr > best_psnr:
             best_psnr = vl_psnr
-            best_state = copy.deepcopy(vae.state_dict())  # EMA weights
+            best_state = copy.deepcopy(vae.state_dict())
             print(f"    >> New best PSNR: {best_psnr:.2f} dB (EMA)")
 
         # Restore non-EMA weights for continued training
@@ -849,22 +879,21 @@ def train_vae(args):
             opt_g=opt_g.state_dict(),
             opt_d=opt_d.state_dict(),
             sched_g=sched_g.state_dict(),
-            sched_d=sched_d.state_dict(),
             ema=ema.state_dict(),
             best_psnr=best_psnr,
+            c_z=args.c_z,
+            latent_dim=args.latent_dim,
         ), ckpt_path)
 
         sched_g.step()
-        sched_d.step()
 
         # Save reconstruction grid (using EMA)
         if (args.save_grid_every > 0
                 and (epoch + 1) % args.save_grid_every == 0):
-            # Temporarily use EMA for grid
             ema.apply(vae)
             grid_path = os.path.join(
                 results_dir,
-                f"recon_grid_vae_v3_epoch{epoch+1}_{args.job_id}.png")
+                f"recon_grid_vae_v5_epoch{epoch+1}_{args.job_id}.png")
             save_recon_grid(vae, val_loader, device, grid_path)
             vae.load_state_dict(orig_state)
 
@@ -876,13 +905,12 @@ def train_vae(args):
     torch.save(vae.state_dict(), ema_weights_path)
     print(f"Best EMA VAE weights saved to {ema_weights_path}")
 
-    # Also save raw (non-EMA) best as secondary
     torch.save(vae.state_dict(), weights_path)
     print(f"VAE weights saved to {weights_path}")
 
     # Final reconstruction grid
     final_grid_path = os.path.join(
-        results_dir, f"recon_grid_vae_v3_final_{args.job_id}.png")
+        results_dir, f"recon_grid_vae_v5_final_{args.job_id}.png")
     save_recon_grid(vae, val_loader, device, final_grid_path)
 
     # Reconstruction FID
@@ -920,12 +948,20 @@ def train_vae(args):
     summary = {
         "job_id": args.job_id,
         "dataset": args.dataset,
-        "vae_arch": "resconv_v3",
+        "vae_arch": "resconv_v5",
+        "disc_arch": "patchgan_v2_specnorm",
         "latent_dim": args.latent_dim,
+        "c_z": args.c_z,
+        "pre_flatten_dim": flat_dim,
+        "fc_compression_ratio": f"{flat_dim}:{args.latent_dim}",
         "beta": args.beta,
         "lambda_lpips": args.lambda_lpips,
         "lambda_adv": args.lambda_adv,
+        "adaptive_adv_weight": args.adaptive_adv_weight,
+        "disc_warmup_epochs": args.disc_warmup_epochs,
+        "disc_ramp_epochs": args.disc_ramp_epochs,
         "adversarial_start_epoch": args.adversarial_start_epoch,
+        "loss_type": "logistic (softplus)",
         "free_bits": args.free_bits,
         "n_epochs": args.n_epochs,
         "seed": args.seed,

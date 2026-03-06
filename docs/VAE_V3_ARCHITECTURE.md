@@ -165,7 +165,7 @@ Conv2d(256, 1, 4x4, stride=1, pad=1)    3x3      [patch predictions]
 
 Output: (B, 1, 3, 3) — each spatial location classifies a receptive field patch. The PatchGAN encourages high-frequency sharpness that pixel-wise losses (L1/MSE) cannot capture. It penalizes blurriness locally rather than globally (Isola et al., 2017).
 
-**No spectral normalization** is applied; the hinge loss provides sufficient training stability at this scale.
+**No spectral normalization** is applied; the R1 gradient penalty (Section 5.5) provides sufficient training stability at this scale.
 
 ## 5. Loss Functions
 
@@ -213,9 +213,36 @@ L_G_adv = -mean(D(x_fake))
 
 The **hinge loss** (Lim & Ye, 2017; Miyato et al., 2018; Brock et al., 2019) is more stable than the original GAN minimax loss or Wasserstein loss. It saturates once the discriminator is confident, preventing gradient explosion. This is the same formulation used in VQGAN (Esser et al., 2021) and BigGAN (Brock et al., 2019).
 
-Weight: `lambda_adv = 0.1`. The adversarial term is kept small relative to reconstruction + perceptual losses to prevent mode collapse while encouraging perceptual sharpness.
+Weight: `lambda_adv = 0.1` (base value). When adaptive adversarial weighting is enabled (Section 5.6), this is modulated by the gradient ratio.
 
-### 5.5 Total Loss
+### 5.5 R1 Gradient Penalty
+
+```
+R1 = E[ || grad_x D(x_real) ||^2 ]
+L_D = L_D_hinge + (gamma / 2) * R1
+```
+
+The **R1 gradient penalty** (Mescheder et al., 2018) penalizes the discriminator's gradient magnitude on real images. This prevents the discriminator from becoming overly confident, which would cause it to provide uninformative gradients to the generator. Without R1, we observed the discriminator loss approaching ~2.0 (the hinge loss saturation point) within 20 epochs of adversarial training, causing PSNR regression.
+
+**Lazy regularization** (Karras et al., 2020): R1 is computed every 16 batches instead of every batch, with the penalty scaled by the interval (`gamma/2 * R1 * r1_every`). This amortizes the cost of the extra backward pass through the discriminator while preserving the regularization effect. This is the same strategy used in StyleGAN2.
+
+Parameters: `gamma = 10.0`, `r1_every = 16`.
+
+### 5.6 Adaptive Adversarial Weight
+
+Following VQGAN (Esser et al., 2021, Eq. 7):
+
+```
+lambda_adaptive = || grad_L_nll w.r.t. psi || / (|| grad_L_adv w.r.t. psi || + 1e-6)
+```
+
+where `psi` is the last convolutional layer of the decoder (`Conv2d(64, 3, 3x3)`) and `L_nll` is the combined reconstruction + perceptual loss (following the VQGAN codebase convention). The `1e-6` term prevents division by zero.
+
+This **adaptive weight** automatically balances reconstruction and adversarial gradients at the decoder output. If the adversarial loss produces much larger gradients than the reconstruction loss, the adaptive weight scales it down (and vice versa). This prevents the adversarial signal from overwhelming reconstruction quality — exactly the failure mode we observed in initial training where PSNR dropped from 19.55 to 18.23 dB after enabling the discriminator.
+
+The adaptive weight is clamped to [0, 10000] and detached from the computation graph.
+
+### 5.7 Total Loss
 
 **Stage 1 (Epochs 1-50, warmup):**
 ```
@@ -224,8 +251,8 @@ L_total = L_recon + beta_eff * KL + lambda_lpips * L_lpips
 
 **Stage 2 (Epochs 51-300, adversarial):**
 ```
-L_G = L_recon + beta_eff * KL + lambda_lpips * L_lpips + lambda_adv * L_G_adv
-L_D = L_D_hinge
+L_G = L_recon + beta_eff * KL + lambda_lpips * L_lpips + lambda_adaptive * L_G_adv
+L_D = L_D_hinge + (gamma / 2) * R1     [R1 every 16 batches]
 ```
 
 The two-stage approach follows VQGAN (Esser et al., 2021): the VAE first learns stable reconstructions, then the discriminator is introduced to sharpen outputs. Starting adversarial training from epoch 1 often leads to training collapse.
@@ -259,15 +286,19 @@ Decay = 0.999. EMA smooths weight updates over ~1000 steps, reducing noise and i
 
 Images are normalized to [-1, 1]: `x = x * 2 - 1` (from [0, 1] after dividing by 255). This matches the Tanh output range. For FID/IS computation downstream, generated images are rescaled back to [0, 1]: `x_01 = (x + 1) / 2`.
 
-### 6.5 Training Schedule Summary
+### 6.5 LPIPS Sampling
+
+Computing LPIPS every batch is expensive (VGG forward pass per batch). To reduce epoch time without sacrificing perceptual loss guidance, LPIPS is computed every `lpips_every` batches (default: 4). In batches where LPIPS is skipped, the loss consists of L1 + KL (+ adversarial if active). This reduces epoch time by approximately 3-4&times; with negligible impact on final quality, since LPIPS gradients are relatively smooth across consecutive batches.
+
+### 6.6 Training Schedule Summary
 
 | Phase | Epochs | Loss Components | Description |
 |-------|--------|----------------|-------------|
 | Beta warmup | 1-10 | L1 + beta(ramp)*KL + LPIPS | KL weight linearly ramped |
 | Reconstruction | 11-50 | L1 + beta*KL + LPIPS | Full reconstruction training |
-| Adversarial | 51-300 | L1 + beta*KL + LPIPS + adv | PatchGAN discriminator added |
+| Adversarial | 51-300 | L1 + beta*KL + LPIPS + adv + R1 | PatchGAN with R1 penalty and adaptive weight |
 
-Total walltime: ~4-6 hours on 1 NVIDIA A100 (80GB HBM).
+Total walltime: ~12-18 hours on 1 NVIDIA A100 (80GB HBM).
 
 ## 7. Evaluation Metrics
 
@@ -333,7 +364,7 @@ The VAE interface is preserved: `.encode(x) -> (mu, logvar)` and `.decode(z) -> 
 
 14. **He, K., Zhang, X., Ren, S., & Sun, J.** (2016). Identity Mappings in Deep Residual Networks. *ECCV 2016.* — Pre-activation residual blocks.
 
-15. **Karras, T., Laine, S., Aittala, M., Hellsten, J., Lehtinen, J., & Aila, T.** (2020). Analyzing and Improving the Image Quality of StyleGAN. *CVPR 2020.* — Tanh output and [-1,1] normalization in modern generative models.
+15. **Karras, T., Laine, S., Aittala, M., Hellsten, J., Lehtinen, J., & Aila, T.** (2020). Analyzing and Improving the Image Quality of StyleGAN. *CVPR 2020.* — StyleGAN2: lazy R1 regularization (every 16 minibatches), Tanh output and [-1,1] normalization.
 
 16. **Lipman, Y., Chen, R. T. Q., Ben-Hamu, H., Nickel, M., & Le, M.** (2023). Flow Matching for Generative Modeling. *ICLR 2023.* — Conditional Flow Matching framework used in our CFM pipeline.
 
@@ -349,12 +380,14 @@ The VAE interface is preserved: `.encode(x) -> (mu, logvar)` and `.decode(z) -> 
 
 22. **Zhao, H., Gallo, O., Frosio, I., & Kautz, J.** (2017). Loss Functions for Image Restoration with Neural Networks. *IEEE Transactions on Computational Imaging, 3*(1), 47-57. — Systematic comparison of L1 vs. L2 (MSE) for image restoration; L1 produces sharper results.
 
+23. **Mescheder, L., Geiger, A., & Nowozin, S.** (2018). Which Training Methods for GANs do actually Converge? *ICML 2018.* — R1 gradient penalty for GAN discriminator regularization; provides convergence guarantees.
+
 ## 10. Files
 
 | File | Purpose |
 |------|---------|
-| `models/train_vae_v3.py` | VAE v3 standalone training script (866 lines) |
-| `models/QuantumLatentCFM_vaev3.py` | Self-contained CFM with embedded VAE v3 (1102 lines) |
-| `jobs/run_vae_v3.sh` | SLURM script for VAE v3 training (300 epochs, ~6h) |
+| `models/train_vae_v3.py` | VAE v3 standalone training script with R1 + adaptive weight |
+| `models/QuantumLatentCFM_vaev3.py` | Self-contained CFM with embedded VAE v3 |
+| `jobs/run_vae_v3.sh` | SLURM script for VAE v3 training (300 epochs, 24h walltime) |
 | `jobs/run_cfm_vaev3_quantum.sh` | SLURM script for quantum CFM with VAE v3 |
 | `jobs/run_cfm_vaev3_classical.sh` | SLURM script for classical CFM with VAE v3 |
