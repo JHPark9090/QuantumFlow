@@ -21,17 +21,17 @@ cd /pscratch/sd/j/junghoon/QuantumFlow
 #   2. Midpoint ODE solver (50 steps = 100 VF evals at 2nd-order accuracy)
 #   3. VF EMA (decay=0.999) -- stabilizes noisy quantum gradients
 #
-# Uses VAE v5 (bottleneck fix) with external pretrained weights.
+# Uses VAE v6 (gradual channel reduction, no adversarial) with external pretrained weights.
 # Quantum VF: 1x8q, SU(4) encoding, QViT butterfly depth=2, ANO pairwise k=2
 #
-# IMPORTANT: Set VAE_CKPT to the path of pretrained VAE v5 weights before submitting.
+# IMPORTANT: Set VAE_CKPT to the path of pretrained VAE v6 weights before submitting.
 # Example:
-#   VAE_CKPT=checkpoints/weights_vae_v5_ema_cifar10_JOBID.pt sbatch jobs/run_qlcfm_cifar_v9.sh
+#   VAE_CKPT=checkpoints/weights_vae_v6_ema_cifar10_JOBID.pt sbatch jobs/run_qlcfm_cifar_v9.sh
 
 VAE_CKPT="${VAE_CKPT:-}"
 
 if [ -z "$VAE_CKPT" ]; then
-    echo "WARNING: No VAE_CKPT specified. Running Phase 1+2 with built-in VAE v5."
+    echo "WARNING: No VAE_CKPT specified. Running Phase 1+2 with built-in VAE v6."
     PHASE="both"
     VAE_CKPT_FLAG=""
 else
@@ -43,7 +43,7 @@ fi
 python -u models/QuantumLatentCFM_v9.py \
     --phase=${PHASE} \
     --dataset=cifar10 \
-    --vae-arch=v5 \
+    --vae-arch=v6 \
     --latent-dim=64 \
     --c-z=4 \
     --beta=0.001 \

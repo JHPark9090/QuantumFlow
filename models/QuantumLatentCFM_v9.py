@@ -95,8 +95,8 @@ def get_args():
     p.add_argument("--beta-warmup-epochs", type=int, default=20)
     p.add_argument("--lambda-perc", type=float, default=0.1)
     p.add_argument("--vae-arch", type=str, default="resconv",
-                   choices=["resconv", "legacy", "v5"],
-                   help="VAE architecture: resconv, legacy, or v5 (bottleneck fix)")
+                   choices=["resconv", "legacy", "v5", "v6"],
+                   help="VAE architecture: resconv, legacy, v5, or v6 (gradual reduction)")
     p.add_argument("--c-z", type=int, default=4,
                    help="Channel count for VAE v5 bottleneck (only used with --vae-arch=v5)")
 
@@ -338,12 +338,13 @@ def load_coco_2d(seed, n_train, n_valtest, batch_size, img_size=32):
             img = Image.open(path).convert("RGB")
             imgs.append(tf(img))
         X = torch.stack(imgs)
+        X = X * 2.0 - 1.0  # normalize to [-1, 1]
         X_tr = X[:n_train]
         X_te = X[n_train:n_train + n_valtest]
     except Exception as e:
         print(f"  [WARN] COCO loading failed ({e}), using synthetic data")
-        X_tr = torch.rand(n_train, 3, img_size, img_size)
-        X_te = torch.rand(n_valtest, 3, img_size, img_size)
+        X_tr = torch.rand(n_train, 3, img_size, img_size) * 2.0 - 1.0
+        X_te = torch.rand(n_valtest, 3, img_size, img_size) * 2.0 - 1.0
     return _make_gen_loaders(X_tr, X_te, batch_size)
 
 
@@ -567,6 +568,106 @@ class ResConvVAE_v5(nn.Module):
         return self.decode(self.reparameterize(mu, logvar)), mu, logvar
 
 
+class ResConvVAE_v6(nn.Module):
+    """VAE v6: Gradual channel reduction with spatial mixing at 4x4.
+
+    Resolution-adaptive: supports img_size=32 (3 downsamples) and
+    img_size=128 (5 downsamples). Both reach 4x4 spatial bottleneck.
+    Output in [-1, 1] via Tanh.
+    """
+
+    def __init__(self, latent_dim=64, in_channels=3, c_z=4, img_size=32):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.c_z = c_z
+
+        enc_layers = []
+        if img_size == 128:
+            enc_layers += [
+                nn.Conv2d(in_channels, 32, 3, 1, 1, bias=False),
+                ResBlock_v3(32), ResBlock_v3(32),
+                nn.Conv2d(32, 32, 3, 2, 1, bias=False),
+                ResBlock_v3(32, 64), ResBlock_v3(64),
+                nn.Conv2d(64, 64, 3, 2, 1, bias=False),
+            ]
+            first_ch = 64
+        elif img_size == 32:
+            enc_layers += [nn.Conv2d(in_channels, 64, 3, 1, 1, bias=False)]
+            first_ch = 64
+        else:
+            raise ValueError(f"img_size={img_size} not supported (use 32 or 128)")
+
+        enc_layers += [
+            ResBlock_v3(first_ch, 64), ResBlock_v3(64),
+            nn.Conv2d(64, 64, 3, 2, 1, bias=False),
+            ResBlock_v3(64, 128), ResBlock_v3(128),
+            nn.Conv2d(128, 128, 3, 2, 1, bias=False),
+            ResBlock_v3(128, 256), ResBlock_v3(256),
+            SelfAttention(256),
+            nn.Conv2d(256, 256, 3, 2, 1, bias=False),
+            ResBlock_v3(256), ResBlock_v3(256),
+            SelfAttention(256),
+            ResBlock_v3(256, 64),
+            nn.GroupNorm(32, 64), nn.SiLU(inplace=True),
+            nn.Conv2d(64, c_z, 3, 1, 1, bias=False),
+        ]
+        self.encoder = nn.Sequential(*enc_layers)
+
+        flat_dim = c_z * 4 * 4
+        self.fc_mu = nn.Linear(flat_dim, latent_dim)
+        self.fc_logvar = nn.Linear(flat_dim, latent_dim)
+        self.fc_dec = nn.Linear(latent_dim, flat_dim)
+
+        dec_layers = [
+            nn.Conv2d(c_z, 64, 3, 1, 1, bias=False),
+            ResBlock_v3(64, 256),
+            ResBlock_v3(256), ResBlock_v3(256),
+            SelfAttention(256),
+            nn.ConvTranspose2d(256, 256, 4, 2, 1, bias=False),
+            ResBlock_v3(256, 128), ResBlock_v3(128),
+            SelfAttention(128),
+            nn.ConvTranspose2d(128, 128, 4, 2, 1, bias=False),
+            ResBlock_v3(128, 64), ResBlock_v3(64),
+            nn.ConvTranspose2d(64, 64, 4, 2, 1, bias=False),
+        ]
+        if img_size == 128:
+            dec_layers += [
+                ResBlock_v3(64), ResBlock_v3(64),
+                nn.ConvTranspose2d(64, 64, 4, 2, 1, bias=False),
+                ResBlock_v3(64, 32), ResBlock_v3(32),
+                nn.ConvTranspose2d(32, 32, 4, 2, 1, bias=False),
+                ResBlock_v3(32), ResBlock_v3(32),
+                nn.GroupNorm(32, 32), nn.SiLU(inplace=True),
+                nn.Conv2d(32, in_channels, 3, 1, 1),
+                nn.Tanh(),
+            ]
+        else:
+            dec_layers += [
+                ResBlock_v3(64), ResBlock_v3(64),
+                nn.GroupNorm(32, 64), nn.SiLU(inplace=True),
+                nn.Conv2d(64, in_channels, 3, 1, 1),
+                nn.Tanh(),
+            ]
+        self.decoder = nn.Sequential(*dec_layers)
+
+    def encode(self, x):
+        h = self.encoder(x).view(x.size(0), -1)
+        mu = self.fc_mu(h)
+        logvar = torch.clamp(self.fc_logvar(h), -20, 2)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
+
+    def decode(self, z):
+        h = F.silu(self.fc_dec(z)).view(-1, self.c_z, 4, 4)
+        return self.decoder(h)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        return self.decode(self.reparameterize(mu, logvar)), mu, logvar
+
+
 class VGGPerceptualLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -599,7 +700,11 @@ class VGGPerceptualLoss(nn.Module):
 def build_vae(args, latent_dim=None, in_channels=3):
     ldim = latent_dim or args.latent_dim
     arch = getattr(args, "vae_arch", "resconv")
-    if arch == "v5":
+    if arch == "v6":
+        return ResConvVAE_v6(latent_dim=ldim, in_channels=in_channels,
+                             c_z=args.c_z,
+                             img_size=getattr(args, "img_size", 32))
+    elif arch == "v5":
         return ResConvVAE_v5(latent_dim=ldim, in_channels=in_channels,
                              c_z=args.c_z)
     elif arch == "resconv":
