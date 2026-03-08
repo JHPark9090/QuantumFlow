@@ -69,7 +69,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
 from tqdm import tqdm
 import scipy.constants  # noqa: F401 -- pre-import for PennyLane/scipy compat
 import pennylane as qml
@@ -315,6 +315,28 @@ def load_fashion_2d(seed, n_train, n_valtest, batch_size, img_size=32):
     return _make_gen_loaders(X_tr, X_te, batch_size)
 
 
+class LazyCOCODataset(Dataset):
+    """Loads COCO images on demand to avoid OOM with large datasets."""
+
+    def __init__(self, img_paths, img_size=128):
+        from torchvision import transforms
+        self.img_paths = img_paths
+        self.tf = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+        ])
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        from PIL import Image
+        img = Image.open(self.img_paths[idx]).convert("RGB")
+        x = self.tf(img)
+        x = x * 2.0 - 1.0  # normalize to [-1, 1]
+        return (x,)
+
+
 def load_coco_2d(seed, n_train, n_valtest, batch_size, img_size=32):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -323,29 +345,32 @@ def load_coco_2d(seed, n_train, n_valtest, batch_size, img_size=32):
     img_dir = os.path.join(data_dir, "train2017")
     try:
         from pycocotools.coco import COCO
-        from PIL import Image
-        from torchvision import transforms
         coco = COCO(ann_file)
-        img_ids = sorted(coco.getImgIds())[:n_train + n_valtest]
-        tf = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-        ])
-        imgs = []
-        for iid in tqdm(img_ids, desc="Loading COCO", leave=False):
+        img_ids = sorted(coco.getImgIds())
+        rng = np.random.RandomState(seed)
+        rng.shuffle(img_ids)
+        img_ids = img_ids[:n_train + n_valtest]
+        paths = []
+        for iid in img_ids:
             info = coco.loadImgs(iid)[0]
-            path = os.path.join(img_dir, info["file_name"])
-            img = Image.open(path).convert("RGB")
-            imgs.append(tf(img))
-        X = torch.stack(imgs)
-        X = X * 2.0 - 1.0  # normalize to [-1, 1]
-        X_tr = X[:n_train]
-        X_te = X[n_train:n_train + n_valtest]
+            paths.append(os.path.join(img_dir, info["file_name"]))
+        train_ds = LazyCOCODataset(paths[:n_train], img_size)
+        valtest_ds = LazyCOCODataset(paths[n_train:n_train + n_valtest], img_size)
+        val_sz = len(valtest_ds) // 2
+        test_sz = len(valtest_ds) - val_sz
+        val_ds, test_ds = random_split(valtest_ds, [val_sz, test_sz])
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                  drop_last=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                                num_workers=2, pin_memory=True)
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                                 num_workers=2, pin_memory=True)
+        return train_loader, val_loader, test_loader
     except Exception as e:
         print(f"  [WARN] COCO loading failed ({e}), using synthetic data")
         X_tr = torch.rand(n_train, 3, img_size, img_size) * 2.0 - 1.0
         X_te = torch.rand(n_valtest, 3, img_size, img_size) * 2.0 - 1.0
-    return _make_gen_loaders(X_tr, X_te, batch_size)
+        return _make_gen_loaders(X_tr, X_te, batch_size)
 
 
 def _make_gen_loaders(X_train, X_valtest, batch_size):
