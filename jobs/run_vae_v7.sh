@@ -5,7 +5,7 @@
 #SBATCH -n 1
 #SBATCH -c 32
 #SBATCH --gpus-per-task=1
-#SBATCH -t 24:00:00
+#SBATCH -t 48:00:00
 #SBATCH -J vae_v7
 #SBATCH -o /pscratch/sd/j/junghoon/QuantumFlow/logs/vae_v7_cifar_%j.out
 #SBATCH -e /pscratch/sd/j/junghoon/QuantumFlow/logs/vae_v7_cifar_%j.err
@@ -30,7 +30,7 @@ RESUME_FLAG=""
 JOB_SUFFIX="${SLURM_JOB_ID}"
 if [ -n "$PREV_JOB_ID" ]; then
     RESUME_FLAG="--resume"
-    JOB_SUFFIX="vae_v7_cifar_${PREV_JOB_ID}"
+    JOB_SUFFIX="${PREV_JOB_ID}"
     echo "Resuming from checkpoint: vae_v7_cifar_${PREV_JOB_ID}"
 fi
 

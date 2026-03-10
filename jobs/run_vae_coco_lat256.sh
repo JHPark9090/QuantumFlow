@@ -33,7 +33,7 @@ RESUME_FLAG=""
 JOB_SUFFIX="${SLURM_JOB_ID}"
 if [ -n "$PREV_JOB_ID" ]; then
     RESUME_FLAG="--resume"
-    JOB_SUFFIX="vae_coco_lat256_${PREV_JOB_ID}"
+    JOB_SUFFIX="${PREV_JOB_ID}"
     echo "Resuming from checkpoint: vae_coco_lat256_${PREV_JOB_ID}"
 fi
 
