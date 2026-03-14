@@ -264,7 +264,7 @@ class EMAModel:
 
 
 # ---------------------------------------------------------------------------
-# 3. Data Loaders (identical to v6)
+# 3. Data Loaders (images scaled to [-1, 1] to match VAE v6 Tanh output)
 # ---------------------------------------------------------------------------
 def load_cifar_2d(seed, n_train, n_valtest, batch_size, img_size=32):
     from torchvision.datasets import CIFAR10
@@ -278,6 +278,8 @@ def load_cifar_2d(seed, n_train, n_valtest, batch_size, img_size=32):
                              align_corners=False)
         X_te = F.interpolate(X_te, size=(img_size, img_size), mode="bilinear",
                              align_corners=False)
+    X_tr = X_tr * 2.0 - 1.0
+    X_te = X_te * 2.0 - 1.0
     X_tr = X_tr[torch.randperm(len(X_tr))[:n_train]]
     X_te = X_te[torch.randperm(len(X_te))[:n_valtest]]
     return _make_gen_loaders(X_tr, X_te, batch_size)
@@ -294,6 +296,8 @@ def load_mnist_2d(seed, n_train, n_valtest, batch_size, img_size=32):
                          align_corners=False).repeat(1, 3, 1, 1)
     X_te = F.interpolate(X_te, size=(img_size, img_size), mode="bilinear",
                          align_corners=False).repeat(1, 3, 1, 1)
+    X_tr = X_tr * 2.0 - 1.0
+    X_te = X_te * 2.0 - 1.0
     X_tr = X_tr[torch.randperm(len(X_tr))]
     X_te = X_te[torch.randperm(len(X_te))]
     return _make_gen_loaders(X_tr, X_te, batch_size)
@@ -310,6 +314,8 @@ def load_fashion_2d(seed, n_train, n_valtest, batch_size, img_size=32):
                          align_corners=False).repeat(1, 3, 1, 1)
     X_te = F.interpolate(X_te, size=(img_size, img_size), mode="bilinear",
                          align_corners=False).repeat(1, 3, 1, 1)
+    X_tr = X_tr * 2.0 - 1.0
+    X_te = X_te * 2.0 - 1.0
     X_tr = X_tr[torch.randperm(len(X_tr))]
     X_te = X_te[torch.randperm(len(X_te))]
     return _make_gen_loaders(X_tr, X_te, batch_size)

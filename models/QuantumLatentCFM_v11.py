@@ -1,60 +1,54 @@
 """
-Quantum Latent CFM v10 — Single-Gate SU(16), No QViT, ANO-Only
-================================================================
+Quantum Latent CFM v11 — SD3.5 VAE + Classical Bottleneck + Quantum VF
+======================================================================
 
-Applies the single-gate encoding insight from Quantum Direct CFM v2/v3 to
-the latent-space QLCFM framework. Uses a SINGLE SU(2^n) gate on ALL n
-qubits (default n=4, SU(16)) instead of brick-layer SU(4) pairs. This
-provides 100% entanglement coverage from encoding alone, making QViT
-redundant (Heisenberg picture: W†HW = H').
+Uses the pretrained Stable Diffusion 3.5 VAE (AutoencoderKL from diffusers)
+instead of a custom-trained VAE, eliminating Phase 1 entirely. A classical
+bottleneck layer compresses the high-dimensional SD3.5 latent (e.g., 4096-d
+for 128x128 images) to a manageable dimension (default 256) before the
+quantum velocity field, then projects back to full latent dim after.
 
-Four configurations (v10a-v10d):
+The quantum velocity field is identical to v10: single SU(2^n) encoding
+gate with pairwise or global ANO measurement.
 
-  v10a: lat128 VAE + concat conditioning + pairwise ANO (k=2, 6 obs)
-  v10b: lat256 VAE + additive conditioning + pairwise ANO (k=2, 6 obs)
-  v10c: lat128 VAE + concat conditioning + global ANO (k=4, 6 obs)
-  v10d: lat256 VAE + additive conditioning + global ANO (k=4, 6 obs)
+Configurations:
+
+  v11a: SD3.5 VAE + bottleneck=256 + concat conditioning + pairwise ANO (k=2)
+  v11b: SD3.5 VAE + bottleneck=256 + additive conditioning + pairwise ANO (k=2)
+  v11c: SD3.5 VAE + bottleneck=256 + concat conditioning + global ANO
+  v11d: SD3.5 VAE + bottleneck=256 + additive conditioning + global ANO
+  v11e: SD3.5 VAE + bottleneck=256 + concat conditioning + pairwise ANO (k=3)
+  v11f: SD3.5 VAE + bottleneck=256 + additive conditioning + pairwise ANO (k=3)
 
 All share:
+  - SD3.5 pretrained VAE (16-channel latent, 8x spatial downscale)
   - 4 qubits, single SU(16) gate (255 generators)
   - No QViT (--vqc-type=none)
-  - ~1:1 enc_proj ratio (256 input → 255 encoding params)
+  - Classical bottleneck: 4096 -> 256 -> quantum -> 256 -> 4096
   - v9 training improvements (logit-normal, midpoint ODE, VF EMA)
 
-Time conditioning:
-  - Concat: z_combined = [z_t, t_emb] (v9 style)
-    → input_dim = latent_dim + time_embed_dim
-    → For lat128: time_embed_dim=128, input_dim=256
-  - Additive: z_combined = z_t + time_mlp(t) (Direct CFM v2/v3 style)
-    → input_dim = latent_dim
-    → For lat256: latent_dim=256, input_dim=256
-
-ANO types:
-  - Pairwise (k=2): C(4,2)=6 wire groups, 4×4 Hermitians (16 params each)
-    → 96 total ANO params, captures 2-body correlations
-  - Global (k=4): 6 independent 16×16 Hermitians on all qubits
-    → 1,536 total ANO params, captures all 1-through-4-body correlations
-
 Usage:
-  # v10a: lat128, concat, pairwise ANO
-  python QuantumLatentCFM_v10.py --phase=2 --dataset=cifar10 \\
-      --latent-dim=128 --time-conditioning=concat --time-embed-dim=128 \\
-      --ano-type=pairwise --vae-ckpt=<path> --vae-arch=v6 --c-z=8
+  # v11a: SD3.5 VAE, bottleneck=256, concat, pairwise ANO
+  python QuantumLatentCFM_v11.py --phase=2 --dataset=cifar10 \\
+      --img-size=128 --bottleneck-dim=256 \\
+      --time-conditioning=concat --time-embed-dim=128 \\
+      --ano-type=pairwise
 
-  # v10b: lat256, additive, pairwise ANO
-  python QuantumLatentCFM_v10.py --phase=2 --dataset=cifar10 \\
-      --latent-dim=256 --time-conditioning=additive \\
-      --ano-type=pairwise --vae-ckpt=<path> --vae-arch=v6 --c-z=16
+  # v11b: SD3.5 VAE, bottleneck=256, additive, pairwise ANO
+  python QuantumLatentCFM_v11.py --phase=2 --dataset=cifar10 \\
+      --img-size=128 --bottleneck-dim=256 \\
+      --time-conditioning=additive --ano-type=pairwise
 
-  # v10c: lat128, concat, global ANO
-  python QuantumLatentCFM_v10.py --phase=2 --dataset=cifar10 \\
-      --latent-dim=128 --time-conditioning=concat --time-embed-dim=128 \\
-      --ano-type=global --vae-ckpt=<path> --vae-arch=v6 --c-z=8
+  # v11c: SD3.5 VAE, bottleneck=256, concat, global ANO
+  python QuantumLatentCFM_v11.py --phase=2 --dataset=cifar10 \\
+      --img-size=128 --bottleneck-dim=256 \\
+      --time-conditioning=concat --time-embed-dim=128 \\
+      --ano-type=global
 
-  # v10d: lat256, additive, global ANO
-  python QuantumLatentCFM_v10.py --phase=2 --dataset=cifar10 \\
-      --latent-dim=256 --time-conditioning=additive \\
-      --ano-type=global --vae-ckpt=<path> --vae-arch=v6 --c-z=16
+  # v11d: SD3.5 VAE, bottleneck=256, additive, global ANO
+  python QuantumLatentCFM_v11.py --phase=2 --dataset=cifar10 \\
+      --img-size=128 --bottleneck-dim=256 \\
+      --time-conditioning=additive --ano-type=global
 
 References:
   - Lipman et al. (2023). Flow Matching for Generative Modeling. ICLR 2023.
@@ -63,6 +57,8 @@ References:
   - Chen et al. (2025). Learning to Measure QNNs. ICASSP 2025 Workshop.
   - Lin et al. (2025). Adaptive Non-local Observable on QNNs. IEEE QCE 2025.
   - Cherrat et al. (2024). Quantum Vision Transformers. Quantum, 8, 1265.
+  - Esser et al. (2024). Scaling Rectified Flow Transformers for
+    High-Resolution Image Synthesis. ICML 2024. (SD3)
 """
 
 import argparse
@@ -92,21 +88,31 @@ DATA_ROOT = "/pscratch/sd/j/junghoon/data"
 # ---------------------------------------------------------------------------
 def get_args():
     p = argparse.ArgumentParser(
-        description="Quantum Latent CFM v10 — Single-Gate SU(16), ANO-Only")
+        description="Quantum Latent CFM v11 — SD3.5 VAE + Bottleneck + "
+                    "Single-Gate SU(16), ANO-Only")
 
-    # Phase
+    # Phase (no phase 1 for SD3)
     p.add_argument("--phase", type=str, default="2",
-                   choices=["1", "2", "generate", "both"],
-                   help="1=VAE pretrain, 2=CFM train, generate=sample, both=1+2")
+                   choices=["2", "generate"],
+                   help="2=CFM train, generate=sample")
 
     # VAE
-    p.add_argument("--latent-dim", type=int, default=128)
-    p.add_argument("--beta", type=float, default=0.5)
-    p.add_argument("--beta-warmup-epochs", type=int, default=20)
-    p.add_argument("--lambda-perc", type=float, default=0.1)
-    p.add_argument("--vae-arch", type=str, default="v6",
-                   choices=["resconv", "legacy", "v5", "v6"])
-    p.add_argument("--c-z", type=int, default=8)
+    p.add_argument("--latent-dim", type=int, default=4096,
+                   help="Full latent dim (auto-computed for SD3: "
+                        "16*(img_size//8)^2)")
+    p.add_argument("--vae-arch", type=str, default="sd3",
+                   choices=["sd3"],
+                   help="VAE architecture (sd3 = SD3.5 pretrained)")
+    p.add_argument("--sd3-model-id", type=str,
+                   default="stabilityai/stable-diffusion-3.5-large",
+                   help="HuggingFace model ID for SD3.5 VAE")
+    p.add_argument("--sd3-weights", type=str, default="",
+                   help="Path to fine-tuned SD3.5 VAE state_dict "
+                        "(empty = use pretrained frozen weights)")
+
+    # Bottleneck
+    p.add_argument("--bottleneck-dim", type=int, default=256,
+                   help="Bottleneck dim for VF (0 = no bottleneck)")
 
     # Quantum circuit
     p.add_argument("--n-circuits", type=int, default=1)
@@ -138,7 +144,6 @@ def get_args():
     # Training
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--lr-H", type=float, default=1e-1)
-    p.add_argument("--lr-vae", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--seed", type=int, default=2025)
@@ -154,16 +159,15 @@ def get_args():
                    choices=["cifar10", "coco", "mnist", "fashion"])
     p.add_argument("--n-train", type=int, default=10000)
     p.add_argument("--n-valtest", type=int, default=2000)
-    p.add_argument("--img-size", type=int, default=32)
+    p.add_argument("--img-size", type=int, default=128)
 
     # ODE sampling
     p.add_argument("--ode-steps", type=int, default=50)
     p.add_argument("--n-samples", type=int, default=64)
 
     # I/O
-    p.add_argument("--job-id", type=str, default="qlcfm_v10_001")
+    p.add_argument("--job-id", type=str, default="qlcfm_v11_001")
     p.add_argument("--base-path", type=str, default=".")
-    p.add_argument("--vae-ckpt", type=str, default="")
     p.add_argument("--cfm-ckpt", type=str, default="")
     p.add_argument("--resume", action="store_true")
 
@@ -274,9 +278,9 @@ class EMAModel:
 
 
 # ---------------------------------------------------------------------------
-# 3. Data Loaders (images scaled to [-1, 1] to match VAE v6 Tanh output)
+# 3. Data Loaders
 # ---------------------------------------------------------------------------
-def load_cifar_2d(seed, n_train, n_valtest, batch_size, img_size=32):
+def load_cifar_2d(seed, n_train, n_valtest, batch_size, img_size=128):
     from torchvision.datasets import CIFAR10
     torch.manual_seed(seed)
     data_train = CIFAR10(root=DATA_ROOT, train=True, download=True)
@@ -284,10 +288,11 @@ def load_cifar_2d(seed, n_train, n_valtest, batch_size, img_size=32):
     X_tr = torch.tensor(data_train.data).float().permute(0, 3, 1, 2) / 255.0
     X_te = torch.tensor(data_test.data).float().permute(0, 3, 1, 2) / 255.0
     if img_size != 32:
-        X_tr = F.interpolate(X_tr, size=(img_size, img_size), mode="bilinear",
+        X_tr = F.interpolate(X_tr, size=(img_size, img_size), mode="bicubic",
                              align_corners=False)
-        X_te = F.interpolate(X_te, size=(img_size, img_size), mode="bilinear",
+        X_te = F.interpolate(X_te, size=(img_size, img_size), mode="bicubic",
                              align_corners=False)
+    # Normalize to [-1, 1] for SD3.5 VAE
     X_tr = X_tr * 2.0 - 1.0
     X_te = X_te * 2.0 - 1.0
     X_tr = X_tr[torch.randperm(len(X_tr))[:n_train]]
@@ -295,17 +300,18 @@ def load_cifar_2d(seed, n_train, n_valtest, batch_size, img_size=32):
     return _make_gen_loaders(X_tr, X_te, batch_size)
 
 
-def load_mnist_2d(seed, n_train, n_valtest, batch_size, img_size=32):
+def load_mnist_2d(seed, n_train, n_valtest, batch_size, img_size=128):
     from torchvision.datasets import MNIST
     torch.manual_seed(seed)
     data_train = MNIST(root=DATA_ROOT, train=True, download=True)
     data_test = MNIST(root=DATA_ROOT, train=False, download=True)
     X_tr = data_train.data[:n_train].float().unsqueeze(1) / 255.0
     X_te = data_test.data[:n_valtest].float().unsqueeze(1) / 255.0
-    X_tr = F.interpolate(X_tr, size=(img_size, img_size), mode="bilinear",
+    X_tr = F.interpolate(X_tr, size=(img_size, img_size), mode="bicubic",
                          align_corners=False).repeat(1, 3, 1, 1)
-    X_te = F.interpolate(X_te, size=(img_size, img_size), mode="bilinear",
+    X_te = F.interpolate(X_te, size=(img_size, img_size), mode="bicubic",
                          align_corners=False).repeat(1, 3, 1, 1)
+    # Normalize to [-1, 1] for SD3.5 VAE
     X_tr = X_tr * 2.0 - 1.0
     X_te = X_te * 2.0 - 1.0
     X_tr = X_tr[torch.randperm(len(X_tr))]
@@ -313,17 +319,18 @@ def load_mnist_2d(seed, n_train, n_valtest, batch_size, img_size=32):
     return _make_gen_loaders(X_tr, X_te, batch_size)
 
 
-def load_fashion_2d(seed, n_train, n_valtest, batch_size, img_size=32):
+def load_fashion_2d(seed, n_train, n_valtest, batch_size, img_size=128):
     from torchvision.datasets import FashionMNIST
     torch.manual_seed(seed)
     data_train = FashionMNIST(root=DATA_ROOT, train=True, download=True)
     data_test = FashionMNIST(root=DATA_ROOT, train=False, download=True)
     X_tr = data_train.data[:n_train].float().unsqueeze(1) / 255.0
     X_te = data_test.data[:n_valtest].float().unsqueeze(1) / 255.0
-    X_tr = F.interpolate(X_tr, size=(img_size, img_size), mode="bilinear",
+    X_tr = F.interpolate(X_tr, size=(img_size, img_size), mode="bicubic",
                          align_corners=False).repeat(1, 3, 1, 1)
-    X_te = F.interpolate(X_te, size=(img_size, img_size), mode="bilinear",
+    X_te = F.interpolate(X_te, size=(img_size, img_size), mode="bicubic",
                          align_corners=False).repeat(1, 3, 1, 1)
+    # Normalize to [-1, 1] for SD3.5 VAE
     X_tr = X_tr * 2.0 - 1.0
     X_te = X_te * 2.0 - 1.0
     X_tr = X_tr[torch.randperm(len(X_tr))]
@@ -340,6 +347,7 @@ class LazyCOCODataset(Dataset):
         self.tf = transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
 
     def __len__(self):
@@ -352,7 +360,7 @@ class LazyCOCODataset(Dataset):
         return (x,)
 
 
-def load_coco_2d(seed, n_train, n_valtest, batch_size, img_size=32):
+def load_coco_2d(seed, n_train, n_valtest, batch_size, img_size=128):
     torch.manual_seed(seed)
     np.random.seed(seed)
     data_dir = os.path.join(DATA_ROOT, "coco")
@@ -385,8 +393,8 @@ def load_coco_2d(seed, n_train, n_valtest, batch_size, img_size=32):
         return train_loader, val_loader, test_loader
     except Exception as e:
         print(f"  [WARN] COCO loading failed ({e}), using synthetic data")
-        X_tr = torch.rand(n_train, 3, img_size, img_size)
-        X_te = torch.rand(n_valtest, 3, img_size, img_size)
+        X_tr = torch.rand(n_train, 3, img_size, img_size) * 2.0 - 1.0
+        X_te = torch.rand(n_valtest, 3, img_size, img_size) * 2.0 - 1.0
         return _make_gen_loaders(X_tr, X_te, batch_size)
 
 
@@ -404,329 +412,89 @@ def _make_gen_loaders(X_train, X_valtest, batch_size):
 
 
 # ---------------------------------------------------------------------------
-# 4. VAE Architectures (from v9, needed for loading pretrained weights)
+# 4. SD3.5 VAE Wrapper
 # ---------------------------------------------------------------------------
-class ConvVAE(nn.Module):
-    def __init__(self, latent_dim=32, in_channels=3):
+class SD3VAEWrapper(nn.Module):
+    """Wraps the pretrained SD3.5 AutoencoderKL for use as a frozen encoder/decoder.
+
+    The SD3.5 VAE uses 16-channel latents with 8x spatial downscale.
+    For a 128x128 input image, the latent is (16, 16, 16) -> flat dim = 4096.
+
+    encode(x) returns (z_flat, None) for compatibility with CFM training.
+    decode(z_flat) reshapes and decodes back to image space.
+    """
+
+    def __init__(self, model_id="stabilityai/stable-diffusion-3.5-large",
+                 img_size=128, weights_path=""):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 4, 2, 1), nn.ReLU(),
-            nn.Conv2d(32, 64, 4, 2, 1), nn.ReLU(),
-            nn.Conv2d(64, 128, 4, 2, 1), nn.ReLU(),
-        )
-        self.fc_mu = nn.Linear(128 * 4 * 4, latent_dim)
-        self.fc_logvar = nn.Linear(128 * 4 * 4, latent_dim)
-        self.fc_dec = nn.Linear(latent_dim, 128 * 4 * 4)
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(32, in_channels, 4, 2, 1), nn.Sigmoid(),
-        )
+        from diffusers import AutoencoderKL
 
-    def encode(self, x):
-        h = self.encoder(x).view(x.size(0), -1)
-        return self.fc_mu(h), torch.clamp(self.fc_logvar(h), -20, 2)
+        self.img_size = img_size
+        spatial = img_size // 8
+        self.latent_channels = 16
+        self.latent_spatial = (spatial, spatial)
+        self.latent_flat_dim = self.latent_channels * spatial * spatial
 
-    def reparameterize(self, mu, logvar):
-        return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
+        print(f"  Loading SD3.5 VAE from {model_id} ...")
+        self.vae = AutoencoderKL.from_pretrained(
+            model_id, subfolder="vae", torch_dtype=torch.float32)
 
-    def decode(self, z):
-        return self.decoder(F.relu(self.fc_dec(z)).view(-1, 128, 4, 4))
+        if weights_path:
+            print(f"  Loading fine-tuned weights from {weights_path} ...")
+            state_dict = torch.load(weights_path, map_location="cpu")
+            self.vae.load_state_dict(state_dict)
+            print(f"  Fine-tuned SD3.5 VAE weights loaded.")
 
-    def forward(self, x):
-        mu, logvar = self.encode(x)
-        return self.decode(self.reparameterize(mu, logvar)), mu, logvar
-
-
-class ResBlock_v3(nn.Module):
-    def __init__(self, in_channels, out_channels=None):
-        super().__init__()
-        out_channels = out_channels or in_channels
-        self.block = nn.Sequential(
-            nn.GroupNorm(32, in_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=False),
-            nn.GroupNorm(32, out_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
-        )
-        self.skip = (nn.Conv2d(in_channels, out_channels, 1, bias=False)
-                     if in_channels != out_channels else nn.Identity())
-
-    def forward(self, x):
-        return self.skip(x) + self.block(x)
-
-
-class SelfAttention(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.norm = nn.GroupNorm(32, channels)
-        self.q = nn.Conv2d(channels, channels, 1)
-        self.k = nn.Conv2d(channels, channels, 1)
-        self.v = nn.Conv2d(channels, channels, 1)
-        self.proj = nn.Conv2d(channels, channels, 1)
-        self.scale = channels ** -0.5
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        h = self.norm(x)
-        q = self.q(h).view(B, C, H * W)
-        k = self.k(h).view(B, C, H * W)
-        v = self.v(h).view(B, C, H * W)
-        attn = torch.bmm(q.transpose(1, 2), k) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.bmm(v, attn.transpose(1, 2)).view(B, C, H, W)
-        return x + self.proj(out)
-
-
-class ResConvVAE(nn.Module):
-    def __init__(self, latent_dim=32, in_channels=3):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 3, 1, 1, bias=False),
-            ResBlock_v3(64), ResBlock_v3(64),
-            nn.Conv2d(64, 64, 3, 2, 1, bias=False),
-            ResBlock_v3(64, 128), ResBlock_v3(128),
-            nn.Conv2d(128, 128, 3, 2, 1, bias=False),
-            ResBlock_v3(128, 256), ResBlock_v3(256),
-            SelfAttention(256),
-            nn.Conv2d(256, 256, 3, 2, 1, bias=False),
-            ResBlock_v3(256), ResBlock_v3(256),
-            SelfAttention(256),
-            nn.GroupNorm(32, 256), nn.SiLU(inplace=True),
-        )
-        self.fc_mu = nn.Linear(256 * 4 * 4, latent_dim)
-        self.fc_logvar = nn.Linear(256 * 4 * 4, latent_dim)
-        self.fc_dec = nn.Linear(latent_dim, 256 * 4 * 4)
-        self.decoder = nn.Sequential(
-            ResBlock_v3(256), ResBlock_v3(256),
-            SelfAttention(256),
-            nn.ConvTranspose2d(256, 256, 4, 2, 1, bias=False),
-            ResBlock_v3(256, 128), ResBlock_v3(128),
-            SelfAttention(128),
-            nn.ConvTranspose2d(128, 128, 4, 2, 1, bias=False),
-            ResBlock_v3(128, 64), ResBlock_v3(64),
-            nn.ConvTranspose2d(64, 64, 4, 2, 1, bias=False),
-            ResBlock_v3(64), ResBlock_v3(64),
-            nn.GroupNorm(32, 64), nn.SiLU(inplace=True),
-            nn.Conv2d(64, in_channels, 3, 1, 1),
-            nn.Sigmoid(),
-        )
-
-    def encode(self, x):
-        h = self.encoder(x).view(x.size(0), -1)
-        return self.fc_mu(h), torch.clamp(self.fc_logvar(h), -20, 2)
-
-    def reparameterize(self, mu, logvar):
-        return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
-
-    def decode(self, z):
-        h = F.relu(self.fc_dec(z)).view(-1, 256, 4, 4)
-        return self.decoder(h)
-
-    def forward(self, x):
-        mu, logvar = self.encode(x)
-        return self.decode(self.reparameterize(mu, logvar)), mu, logvar
-
-
-class ResConvVAE_v5(nn.Module):
-    """VAE v5: Stops at 4x4, uses 1x1 conv for channel reduction."""
-
-    def __init__(self, latent_dim=64, in_channels=3, c_z=4):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.c_z = c_z
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 3, 1, 1, bias=False),
-            ResBlock_v3(64), ResBlock_v3(64),
-            nn.Conv2d(64, 64, 3, 2, 1, bias=False),
-            ResBlock_v3(64, 128), ResBlock_v3(128),
-            nn.Conv2d(128, 128, 3, 2, 1, bias=False),
-            ResBlock_v3(128, 256), ResBlock_v3(256),
-            SelfAttention(256),
-            nn.Conv2d(256, 256, 3, 2, 1, bias=False),
-            ResBlock_v3(256), ResBlock_v3(256),
-            SelfAttention(256),
-            nn.GroupNorm(32, 256), nn.SiLU(inplace=True),
-            nn.Conv2d(256, c_z, 1, bias=False),
-        )
-        flat_dim = c_z * 4 * 4
-        self.fc_mu = nn.Linear(flat_dim, latent_dim)
-        self.fc_logvar = nn.Linear(flat_dim, latent_dim)
-        self.fc_dec = nn.Linear(latent_dim, flat_dim)
-        self.decoder = nn.Sequential(
-            nn.Conv2d(c_z, 256, 1, bias=False),
-            ResBlock_v3(256), ResBlock_v3(256),
-            SelfAttention(256),
-            nn.ConvTranspose2d(256, 256, 4, 2, 1, bias=False),
-            ResBlock_v3(256, 128), ResBlock_v3(128),
-            SelfAttention(128),
-            nn.ConvTranspose2d(128, 128, 4, 2, 1, bias=False),
-            ResBlock_v3(128, 64), ResBlock_v3(64),
-            nn.ConvTranspose2d(64, 64, 4, 2, 1, bias=False),
-            ResBlock_v3(64), ResBlock_v3(64),
-            nn.GroupNorm(32, 64), nn.SiLU(inplace=True),
-            nn.Conv2d(64, in_channels, 3, 1, 1),
-            nn.Tanh(),
-        )
-
-    def encode(self, x):
-        h = self.encoder(x).view(x.size(0), -1)
-        mu = self.fc_mu(h)
-        logvar = torch.clamp(self.fc_logvar(h), -20, 2)
-        return mu, logvar
-
-    def reparameterize(self, mu, logvar):
-        return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
-
-    def decode(self, z):
-        h = F.silu(self.fc_dec(z)).view(-1, self.c_z, 4, 4)
-        return self.decoder(h)
-
-    def forward(self, x):
-        mu, logvar = self.encode(x)
-        return self.decode(self.reparameterize(mu, logvar)), mu, logvar
-
-
-class ResConvVAE_v6(nn.Module):
-    """VAE v6: Gradual channel reduction, resolution-adaptive."""
-
-    def __init__(self, latent_dim=64, in_channels=3, c_z=4, img_size=32):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.c_z = c_z
-
-        enc_layers = []
-        if img_size == 128:
-            enc_layers += [
-                nn.Conv2d(in_channels, 32, 3, 1, 1, bias=False),
-                ResBlock_v3(32), ResBlock_v3(32),
-                nn.Conv2d(32, 32, 3, 2, 1, bias=False),
-                ResBlock_v3(32, 64), ResBlock_v3(64),
-                nn.Conv2d(64, 64, 3, 2, 1, bias=False),
-            ]
-            first_ch = 64
-        elif img_size == 32:
-            enc_layers += [nn.Conv2d(in_channels, 64, 3, 1, 1, bias=False)]
-            first_ch = 64
-        else:
-            raise ValueError(f"img_size={img_size} not supported (use 32 or 128)")
-
-        enc_layers += [
-            ResBlock_v3(first_ch, 64), ResBlock_v3(64),
-            nn.Conv2d(64, 64, 3, 2, 1, bias=False),
-            ResBlock_v3(64, 128), ResBlock_v3(128),
-            nn.Conv2d(128, 128, 3, 2, 1, bias=False),
-            ResBlock_v3(128, 256), ResBlock_v3(256),
-            SelfAttention(256),
-            nn.Conv2d(256, 256, 3, 2, 1, bias=False),
-            ResBlock_v3(256), ResBlock_v3(256),
-            SelfAttention(256),
-            ResBlock_v3(256, 64),
-            nn.GroupNorm(32, 64), nn.SiLU(inplace=True),
-            nn.Conv2d(64, c_z, 3, 1, 1, bias=False),
-        ]
-        self.encoder = nn.Sequential(*enc_layers)
-
-        flat_dim = c_z * 4 * 4
-        self.fc_mu = nn.Linear(flat_dim, latent_dim)
-        self.fc_logvar = nn.Linear(flat_dim, latent_dim)
-        self.fc_dec = nn.Linear(latent_dim, flat_dim)
-
-        dec_layers = [
-            nn.Conv2d(c_z, 64, 3, 1, 1, bias=False),
-            ResBlock_v3(64, 256),
-            ResBlock_v3(256), ResBlock_v3(256),
-            SelfAttention(256),
-            nn.ConvTranspose2d(256, 256, 4, 2, 1, bias=False),
-            ResBlock_v3(256, 128), ResBlock_v3(128),
-            SelfAttention(128),
-            nn.ConvTranspose2d(128, 128, 4, 2, 1, bias=False),
-            ResBlock_v3(128, 64), ResBlock_v3(64),
-            nn.ConvTranspose2d(64, 64, 4, 2, 1, bias=False),
-        ]
-        if img_size == 128:
-            dec_layers += [
-                ResBlock_v3(64), ResBlock_v3(64),
-                nn.ConvTranspose2d(64, 64, 4, 2, 1, bias=False),
-                ResBlock_v3(64, 32), ResBlock_v3(32),
-                nn.ConvTranspose2d(32, 32, 4, 2, 1, bias=False),
-                ResBlock_v3(32), ResBlock_v3(32),
-                nn.GroupNorm(32, 32), nn.SiLU(inplace=True),
-                nn.Conv2d(32, in_channels, 3, 1, 1),
-                nn.Tanh(),
-            ]
-        else:
-            dec_layers += [
-                ResBlock_v3(64), ResBlock_v3(64),
-                nn.GroupNorm(32, 64), nn.SiLU(inplace=True),
-                nn.Conv2d(64, in_channels, 3, 1, 1),
-                nn.Tanh(),
-            ]
-        self.decoder = nn.Sequential(*dec_layers)
-
-    def encode(self, x):
-        h = self.encoder(x).view(x.size(0), -1)
-        mu = self.fc_mu(h)
-        logvar = torch.clamp(self.fc_logvar(h), -20, 2)
-        return mu, logvar
-
-    def reparameterize(self, mu, logvar):
-        return mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
-
-    def decode(self, z):
-        h = F.silu(self.fc_dec(z)).view(-1, self.c_z, 4, 4)
-        return self.decoder(h)
-
-    def forward(self, x):
-        mu, logvar = self.encode(x)
-        return self.decode(self.reparameterize(mu, logvar)), mu, logvar
-
-
-class VGGPerceptualLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        from torchvision.models import vgg16, VGG16_Weights
-        vgg = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
-        slices = [4, 9, 16, 23]
-        self.blocks = nn.ModuleList()
-        prev = 0
-        for s in slices:
-            self.blocks.append(nn.Sequential(*list(vgg.children())[prev:s]))
-            prev = s
-        for p in self.parameters():
+        # Freeze all VAE parameters
+        for p in self.vae.parameters():
             p.requires_grad = False
-        self.register_buffer("mean",
-                             torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std",
-                             torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.vae.eval()
 
-    def forward(self, x, y):
-        x = (x - self.mean) / self.std
-        y = (y - self.mean) / self.std
-        loss = 0.0
-        for block in self.blocks:
-            x = block(x)
-            y = block(y)
-            loss += F.l1_loss(x, y)
-        return loss / len(self.blocks)
+        print(f"  SD3.5 VAE loaded: latent shape = ({self.latent_channels}, "
+              f"{spatial}, {spatial}), flat dim = {self.latent_flat_dim}")
+
+    def encode(self, x):
+        """Encode images to flattened latent vectors.
+
+        Args:
+            x: (batch, 3, H, W) images in [-1, 1]
+
+        Returns:
+            z_flat: (batch, latent_flat_dim) flattened latent
+            None: placeholder for compatibility (no logvar)
+        """
+        with torch.no_grad():
+            z = self.vae.encode(x).latent_dist.mean  # deterministic
+        z_flat = z.reshape(z.size(0), -1)
+        return z_flat, None
+
+    def decode(self, z_flat):
+        """Decode flattened latent vectors to images.
+
+        Args:
+            z_flat: (batch, latent_flat_dim) flattened latent
+
+        Returns:
+            images: (batch, 3, H, W) in [-1, 1]
+        """
+        z = z_flat.view(-1, self.latent_channels,
+                        self.latent_spatial[0], self.latent_spatial[1])
+        with torch.no_grad():
+            images = self.vae.decode(z).sample
+        return images.clamp(-1, 1)
+
+    def forward(self, x):
+        z_flat, _ = self.encode(x)
+        return self.decode(z_flat)
 
 
-def build_vae(args, latent_dim=None, in_channels=3):
-    ldim = latent_dim or args.latent_dim
-    arch = getattr(args, "vae_arch", "resconv")
-    if arch == "v6":
-        return ResConvVAE_v6(latent_dim=ldim, in_channels=in_channels,
-                             c_z=args.c_z,
-                             img_size=getattr(args, "img_size", 32))
-    elif arch == "v5":
-        return ResConvVAE_v5(latent_dim=ldim, in_channels=in_channels,
-                             c_z=args.c_z)
-    elif arch == "resconv":
-        return ResConvVAE(latent_dim=ldim, in_channels=in_channels)
-    return ConvVAE(latent_dim=ldim, in_channels=in_channels)
+def build_vae(args):
+    """Build VAE (SD3.5 only in v11)."""
+    if args.vae_arch == "sd3":
+        return SD3VAEWrapper(model_id=args.sd3_model_id,
+                             img_size=args.img_size,
+                             weights_path=args.sd3_weights)
+    raise ValueError(f"v11 only supports vae_arch='sd3', got '{args.vae_arch}'")
 
 
 # ---------------------------------------------------------------------------
@@ -789,8 +557,8 @@ class SingleGateQuantumCircuit(nn.Module):
 
     For n=4 (SU(16)):
       - Encoding: 255 generators, single gate on all 4 qubits
-      - Pairwise ANO (k=2): C(4,2)=6 observables, 4×4 Hermitians, 96 ANO params
-      - Global ANO (k=4): m independent 16×16 Hermitians, 256 params each
+      - Pairwise ANO (k=2): C(4,2)=6 observables, 4x4 Hermitians, 96 ANO params
+      - Global ANO (k=4): m independent 16x16 Hermitians, 256 params each
 
     Uses PennyLane SpecialUnitary for n<=5 (works with default.qubit + backprop).
     """
@@ -811,14 +579,14 @@ class SingleGateQuantumCircuit(nn.Module):
         self.n_generators = n_gen
         self.enc_per_block = enc_size
 
-        # Projection: input_dim → enc_size (~1:1 ratio)
+        # Projection: input_dim -> enc_size (~1:1 ratio)
         self.enc_proj = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.SiLU(),
             nn.Linear(256, enc_size),
         )
 
-        # VQC (optional — default none since SU(2^n) provides full entanglement)
+        # VQC (optional -- default none since SU(2^n) provides full entanglement)
         if vqc_type == "qvit":
             n_rbs = _qvit_n_params(n_qubits, qvit_circuit)
             self.qvit_params = nn.Parameter(
@@ -985,36 +753,47 @@ class SingleGateQuantumCircuit(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 5c. Quantum Velocity Field (supports concat/additive time conditioning)
+# 5c. Quantum Velocity Field (with bottleneck support)
 # ---------------------------------------------------------------------------
 class QuantumVelocityField(nn.Module):
     def __init__(self, latent_dim, n_circuits, n_qubits, ano_type,
                  n_observables, k_local=2, vqc_type="none", vqc_depth=2,
                  qvit_circuit="butterfly", time_embed_dim=128,
-                 time_conditioning="concat"):
+                 time_conditioning="concat", bottleneck_dim=0):
         super().__init__()
         self.latent_dim = latent_dim
         self.n_circuits = n_circuits
         self.n_qubits = n_qubits
         self.time_embed_dim = time_embed_dim
         self.time_conditioning = time_conditioning
+        self.bottleneck_dim = bottleneck_dim
+
+        # Determine working dimension (bottleneck or full latent)
+        use_bottleneck = (bottleneck_dim > 0 and bottleneck_dim != latent_dim)
+        self.use_bottleneck = use_bottleneck
+        working_dim = bottleneck_dim if use_bottleneck else latent_dim
+
+        if use_bottleneck:
+            self.bottleneck_in = nn.Linear(latent_dim, bottleneck_dim)
+            print(f"  Bottleneck: {latent_dim} -> {bottleneck_dim} -> "
+                  f"quantum -> {bottleneck_dim} -> {latent_dim}")
 
         if time_conditioning == "additive":
-            # Project time to latent_dim, add to z_t
+            # Project time to working_dim, add to z
             self.time_mlp = nn.Sequential(
-                nn.Linear(time_embed_dim, latent_dim),
+                nn.Linear(time_embed_dim, working_dim),
                 nn.SiLU(),
-                nn.Linear(latent_dim, latent_dim),
+                nn.Linear(working_dim, working_dim),
             )
-            input_dim = latent_dim
+            input_dim = working_dim
         else:
-            # Concatenate z_t and t_emb
+            # Concatenate z and t_emb
             self.time_mlp = nn.Sequential(
                 nn.Linear(time_embed_dim, time_embed_dim),
                 nn.SiLU(),
                 nn.Linear(time_embed_dim, time_embed_dim),
             )
-            input_dim = latent_dim + time_embed_dim
+            input_dim = working_dim + time_embed_dim
 
         self.circuits = nn.ModuleList()
         for k in range(n_circuits):
@@ -1031,8 +810,11 @@ class QuantumVelocityField(nn.Module):
         self.vel_head = nn.Sequential(
             nn.Linear(self.total_obs, _vh),
             nn.SiLU(),
-            nn.Linear(_vh, latent_dim),
+            nn.Linear(_vh, working_dim),
         )
+
+        if use_bottleneck:
+            self.bottleneck_out = nn.Linear(working_dim, latent_dim)
 
     def _time_embedding(self, t):
         half = self.time_embed_dim // 2
@@ -1042,16 +824,33 @@ class QuantumVelocityField(nn.Module):
         return torch.cat([args.cos(), args.sin()], dim=-1)
 
     def forward(self, z_t, t):
+        # Bottleneck compression
+        if self.use_bottleneck:
+            z_work = self.bottleneck_in(z_t)
+        else:
+            z_work = z_t
+
+        # Time conditioning
         t_emb = self.time_mlp(self._time_embedding(t))
         if self.time_conditioning == "additive":
-            z_combined = z_t + t_emb
+            z_combined = z_work + t_emb
         else:
-            z_combined = torch.cat([z_t, t_emb], dim=-1)
+            z_combined = torch.cat([z_work, t_emb], dim=-1)
+
+        # Quantum circuits
         q_outputs = []
         for k in range(self.n_circuits):
             q_outputs.append(self.circuits[k](z_combined))
         q_all = torch.cat(q_outputs, dim=1)
-        return self.vel_head(q_all)
+
+        # Velocity head
+        v = self.vel_head(q_all)
+
+        # Bottleneck expansion
+        if self.use_bottleneck:
+            v = self.bottleneck_out(v)
+
+        return v
 
     def get_eigenvalue_range(self):
         lo, hi = float("inf"), float("-inf")
@@ -1077,144 +876,13 @@ def build_velocity_field(args, device):
             vqc_type=args.vqc_type, vqc_depth=args.vqc_depth,
             qvit_circuit=args.qvit_circuit,
             time_embed_dim=args.time_embed_dim,
-            time_conditioning=args.time_conditioning).to(device)
+            time_conditioning=args.time_conditioning,
+            bottleneck_dim=args.bottleneck_dim).to(device)
     return vf
 
 
 # ---------------------------------------------------------------------------
-# 6. Phase 1 — VAE Pretraining (same as v9)
-# ---------------------------------------------------------------------------
-def train_vae(args, train_loader, val_loader, device):
-    vae = build_vae(args).to(device)
-    optimizer = torch.optim.Adam(vae.parameters(), lr=args.lr_vae)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6)
-
-    perc_fn = None
-    if args.lambda_perc > 0:
-        perc_fn = VGGPerceptualLoss().to(device)
-        print(f"[Phase 1] VGG perceptual loss enabled (lambda={args.lambda_perc})")
-
-    total_p = sum(p.numel() for p in vae.parameters() if p.requires_grad)
-    print(f"[Phase 1] VAE arch={args.vae_arch}  params: {total_p:,}")
-
-    ckpt_dir = os.path.join(args.base_path, "checkpoints")
-    results_dir = os.path.join(args.base_path, "results")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(results_dir, exist_ok=True)
-    ckpt_path = os.path.join(ckpt_dir, f"ckpt_vae_{args.job_id}.pt")
-    csv_path = os.path.join(results_dir, f"log_vae_{args.job_id}.csv")
-    fields = ["epoch", "train_loss", "train_recon", "train_kl", "train_perc",
-              "val_loss", "val_recon", "val_kl", "val_perc", "time_s"]
-
-    start_epoch = 0
-    best_val, best_state = float("inf"), None
-
-    if args.resume and os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, weights_only=False)
-        vae.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        if "scheduler" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler"])
-        start_epoch = ckpt["epoch"] + 1
-        best_val = ckpt.get("best_val", float("inf"))
-        print(f"  Resumed from epoch {start_epoch}")
-
-    if start_epoch == 0:
-        with open(csv_path, "w", newline="") as f:
-            csv.DictWriter(f, fields).writeheader()
-
-    warmup = max(args.beta_warmup_epochs, 1)
-
-    for epoch in range(start_epoch, args.epochs):
-        t0 = time.time()
-        beta_eff = args.beta * min(1.0, (epoch + 1) / warmup)
-
-        vae.train()
-        tr_loss, tr_rec, tr_kl, tr_perc, tr_n = 0., 0., 0., 0., 0
-        for (xb,) in tqdm(train_loader, desc=f"VAE Ep {epoch+1}/{args.epochs}",
-                          leave=False):
-            xb = xb.to(device)
-            x_hat, mu, logvar = vae(xb)
-            recon = F.mse_loss(x_hat, xb)
-            kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-            loss = recon + beta_eff * kl
-            perc_val = 0.0
-            if perc_fn is not None:
-                perc = perc_fn(x_hat, xb)
-                loss = loss + args.lambda_perc * perc
-                perc_val = perc.item()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            bs = xb.size(0)
-            tr_loss += loss.item() * bs
-            tr_rec += recon.item() * bs
-            tr_kl += kl.item() * bs
-            tr_perc += perc_val * bs
-            tr_n += bs
-
-        tr_loss /= tr_n; tr_rec /= tr_n; tr_kl /= tr_n; tr_perc /= tr_n
-
-        vae.eval()
-        vl_loss, vl_rec, vl_kl, vl_perc, vl_n = 0., 0., 0., 0., 0
-        with torch.no_grad():
-            for (xb,) in val_loader:
-                xb = xb.to(device)
-                x_hat, mu, logvar = vae(xb)
-                recon = F.mse_loss(x_hat, xb)
-                kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                loss = recon + beta_eff * kl
-                perc_val = 0.0
-                if perc_fn is not None:
-                    perc = perc_fn(x_hat, xb)
-                    loss = loss + args.lambda_perc * perc
-                    perc_val = perc.item()
-                bs = xb.size(0)
-                vl_loss += loss.item() * bs
-                vl_rec += recon.item() * bs
-                vl_kl += kl.item() * bs
-                vl_perc += perc_val * bs
-                vl_n += bs
-
-        vl_loss /= vl_n; vl_rec /= vl_n; vl_kl /= vl_n; vl_perc /= vl_n
-        dt = time.time() - t0
-
-        row = dict(epoch=epoch + 1, train_loss=f"{tr_loss:.6f}",
-                   train_recon=f"{tr_rec:.6f}", train_kl=f"{tr_kl:.6f}",
-                   train_perc=f"{tr_perc:.6f}",
-                   val_loss=f"{vl_loss:.6f}", val_recon=f"{vl_rec:.6f}",
-                   val_kl=f"{vl_kl:.6f}", val_perc=f"{vl_perc:.6f}",
-                   time_s=f"{dt:.1f}")
-        with open(csv_path, "a", newline="") as f:
-            csv.DictWriter(f, fields).writerow(row)
-
-        print(f"  Ep {epoch+1:3d} | Train {tr_loss:.4f} "
-              f"(rec={tr_rec:.4f} kl={tr_kl:.4f} perc={tr_perc:.4f}) | "
-              f"Val {vl_loss:.4f} | beta={beta_eff:.3f} | {dt:.1f}s")
-
-        if vl_loss < best_val:
-            best_val = vl_loss
-            best_state = copy.deepcopy(vae.state_dict())
-
-        torch.save(dict(epoch=epoch, model=vae.state_dict(),
-                        optimizer=optimizer.state_dict(),
-                        scheduler=scheduler.state_dict(),
-                        vae_arch=args.vae_arch,
-                        best_val=best_val), ckpt_path)
-        scheduler.step()
-
-    if best_state is not None:
-        vae.load_state_dict(best_state)
-
-    w_path = os.path.join(ckpt_dir, f"weights_vae_{args.job_id}.pt")
-    torch.save(vae.state_dict(), w_path)
-    print(f"  VAE saved to {w_path}")
-    return vae
-
-
-# ---------------------------------------------------------------------------
-# 7. Phase 2 — CFM Training (v9 improvements)
+# 6. Phase 2 — CFM Training (v9 improvements)
 # ---------------------------------------------------------------------------
 def train_cfm(args, vae, train_loader, val_loader, device):
     vae.eval()
@@ -1261,20 +929,25 @@ def train_cfm(args, vae, train_loader, val_loader, device):
 
     if args.velocity_field == "quantum":
         enc_per = vf.circuits[0].enc_per_block
+        working_dim = (args.bottleneck_dim
+                       if vf.use_bottleneck else args.latent_dim)
         if args.time_conditioning == "additive":
-            input_dim = args.latent_dim
+            input_dim = working_dim
             print(f"  Time conditioning: additive (z_t + time_mlp(t))")
-            print(f"  Input: z_t[{args.latent_dim}] + time -> {input_dim}")
+            print(f"  Input: z_t[{working_dim}] + time -> {input_dim}")
         else:
-            input_dim = args.latent_dim + args.time_embed_dim
+            input_dim = working_dim + args.time_embed_dim
             print(f"  Time conditioning: concat [z_t, t_emb]")
-            print(f"  Input: concat(z_t[{args.latent_dim}], "
+            print(f"  Input: concat(z_t[{working_dim}], "
                   f"t_emb[{args.time_embed_dim}]) = {input_dim}")
         print(f"  Encoding: single SU({2**args.n_qubits}), "
               f"{enc_per} params/circuit")
         print(f"  VQC: {args.vqc_type}")
         print(f"  ANO: {args.ano_type}, {vf.total_obs} observables")
         print(f"  enc_proj ratio: {input_dim/enc_per:.2f}:1")
+        if vf.use_bottleneck:
+            print(f"  Bottleneck: {args.latent_dim} -> {args.bottleneck_dim} "
+                  f"-> quantum -> {args.bottleneck_dim} -> {args.latent_dim}")
     else:
         print(f"  Classical MLP: hidden_dims={args.mlp_hidden_dims}")
 
@@ -1448,7 +1121,7 @@ def train_cfm(args, vae, train_loader, val_loader, device):
 
 
 # ---------------------------------------------------------------------------
-# 8. Generation (midpoint ODE)
+# 7. Generation (midpoint ODE)
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def generate_samples(vae, vf, n_samples, ode_steps, latent_dim, device,
@@ -1474,10 +1147,8 @@ def generate_samples(vae, vf, n_samples, ode_steps, latent_dim, device,
             z = z + dt * v
 
     images = vae.decode(z)
-    if images.min() < -0.5:
-        images = (images.clamp(-1, 1) + 1) / 2
-    else:
-        images = images.clamp(0, 1)
+    # SD3.5 VAE outputs in [-1, 1], convert to [0, 1] for saving
+    images = (images.clamp(-1, 1) + 1) / 2
 
     if save_path:
         from torchvision.utils import save_image
@@ -1488,7 +1159,7 @@ def generate_samples(vae, vf, n_samples, ode_steps, latent_dim, device,
 
 
 # ---------------------------------------------------------------------------
-# 8b. FID & IS Evaluation
+# 7b. FID & IS Evaluation
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def evaluate_fid_is(vae, vf, real_loader, n_samples, ode_steps,
@@ -1503,8 +1174,8 @@ def evaluate_fid_is(vae, vf, real_loader, n_samples, ode_steps,
     n_real = 0
     for (xb,) in real_loader:
         xb = xb.to(device)
-        if xb.min() < -0.5:
-            xb = (xb.clamp(-1, 1) + 1) / 2
+        # Convert from [-1,1] to [0,1] for metrics
+        xb = (xb.clamp(-1, 1) + 1) / 2
         fid.update(xb, real=True)
         n_real += xb.size(0)
         if n_real >= n_samples:
@@ -1530,7 +1201,7 @@ def evaluate_fid_is(vae, vf, real_loader, n_samples, ode_steps,
 
 
 # ---------------------------------------------------------------------------
-# 9. Main
+# 8. Main
 # ---------------------------------------------------------------------------
 def main():
     args = get_args()
@@ -1539,6 +1210,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"PennyLane {qml.__version__}  |  PyTorch {torch.__version__}  |  "
           f"{device}")
+
+    # Compute latent_dim for SD3 VAE
+    if args.vae_arch == "sd3":
+        args.latent_dim = 16 * (args.img_size // 8) ** 2
+        print(f"SD3.5 VAE latent_dim = 16 * ({args.img_size}//8)^2 = "
+              f"{args.latent_dim}")
 
     if args.velocity_field == "quantum":
         label = (f"Quantum {args.n_circuits}x{args.n_qubits}q "
@@ -1549,6 +1226,9 @@ def main():
           f"Latent dim: {args.latent_dim}  |  VF: {label}")
     print(f"Time conditioning: {args.time_conditioning}  |  "
           f"time_embed_dim: {args.time_embed_dim}")
+    if args.bottleneck_dim > 0 and args.bottleneck_dim != args.latent_dim:
+        print(f"Bottleneck: {args.latent_dim} -> {args.bottleneck_dim} -> "
+              f"quantum -> {args.bottleneck_dim} -> {args.latent_dim}")
     print(f"v9 improvements: logit-normal(std={args.logit_normal_std}), "
           f"ODE={args.ode_solver}({args.ode_steps}), "
           f"VF-EMA(decay={args.vf_ema_decay})")
@@ -1567,31 +1247,11 @@ def main():
     print(f"Data: train={args.n_train}  valtest={args.n_valtest}  "
           f"img_size={args.img_size}")
 
-    # -- Phase 1: VAE --
-    if args.phase in ("1", "both"):
-        print("\n=== Phase 1: VAE Pretraining ===")
-        vae = train_vae(args, train_loader, val_loader, device)
-    else:
-        vae = None
-
     # -- Phase 2: CFM --
-    if args.phase in ("2", "both"):
-        print(f"\n=== Phase 2: {label} CFM Training (v10) ===")
+    if args.phase == "2":
+        print(f"\n=== Phase 2: {label} CFM Training (v11 — SD3.5 VAE) ===")
 
-        if vae is None:
-            vae_path = args.vae_ckpt
-            if not vae_path:
-                vae_path = os.path.join(args.base_path, "checkpoints",
-                                        f"weights_vae_{args.job_id}.pt")
-            if not os.path.exists(vae_path):
-                print(f"ERROR: VAE weights not found at {vae_path}")
-                print("  Run --phase=1 first or provide --vae-ckpt=<path>")
-                return
-            vae = build_vae(args).to(device)
-            vae.load_state_dict(
-                torch.load(vae_path, weights_only=True, map_location=device))
-            print(f"  Loaded VAE from {vae_path}")
-
+        vae = build_vae(args).to(device)
         vf = train_cfm(args, vae, train_loader, val_loader, device)
 
         img_path = os.path.join(args.base_path, "results",
@@ -1616,19 +1276,14 @@ def main():
     # -- Generate only --
     if args.phase == "generate":
         print("\n=== Generation ===")
-        vae_path = args.vae_ckpt or os.path.join(
-            args.base_path, "checkpoints", f"weights_vae_{args.job_id}.pt")
         cfm_path = args.cfm_ckpt or os.path.join(
             args.base_path, "checkpoints", f"weights_cfm_{args.job_id}.pt")
 
-        if not os.path.exists(vae_path) or not os.path.exists(cfm_path):
-            print(f"ERROR: Need both VAE ({vae_path}) and "
-                  f"CFM ({cfm_path}) weights")
+        if not os.path.exists(cfm_path):
+            print(f"ERROR: CFM weights not found at {cfm_path}")
             return
 
         vae = build_vae(args).to(device)
-        vae.load_state_dict(
-            torch.load(vae_path, weights_only=True, map_location=device))
 
         vf = build_velocity_field(args, device)
         vf.load_state_dict(

@@ -4,9 +4,9 @@
 
 QLCFM v10 represents a fundamental shift in the quantum velocity field architecture. Instead of using brick-layer SU(4) encoding with a QViT ansatz circuit (v9), v10 uses a **single SU(16) gate on all 4 qubits** with **Adaptive Non-Local Observables (ANO)** for measurement. This eliminates the need for a post-encoding variational ansatz entirely.
 
-Four configurations (v10a--v10d) explore two independent design axes:
+Six configurations (v10a--v10f) explore two independent design axes:
 - **Time conditioning**: how the diffusion timestep is injected into the circuit
-- **ANO type**: how quantum observables are structured for measurement
+- **ANO type**: how quantum observables are structured for measurement (pairwise k=2, pairwise k=3, or global k=4)
 
 ## v9 vs v10: Architectural Comparison
 
@@ -148,9 +148,9 @@ where:
 
 The ANO parameters are trained with a **separate optimizer** at a higher learning rate (lr=0.1 for ANO vs lr=0.001 for circuit parameters), following the dual-optimizer strategy from Chen et al. (2025).
 
-## Pairwise ANO vs Global ANO
+## ANO Locality Hierarchy: k=2, k=3, k=4
 
-The two ANO types differ in **which qubits are measured together** and **what correlations they can capture**.
+The ANO locality parameter k controls **which qubit subsets are measured together** and **what correlation orders they can capture**. For 4 qubits, three settings are explored:
 
 ### Pairwise ANO (k=2)
 
@@ -171,9 +171,27 @@ Each 4x4 Hermitian has 16 free parameters (6 off-diagonal real + 6 off-diagonal 
 - **Correlation order**: Captures up to **2-body correlations** -- how pairs of qubits are correlated
 - **Cannot capture**: 3-body or 4-body correlations (e.g., simultaneous entanglement patterns across 3+ qubits)
 
+### Triple ANO (k=3)
+
+Triple ANO measures **3-qubit subsystems**. For 4 qubits, there are C(4,3) = 4 possible triples:
+
+```
+Observable 1: qubits (0, 1, 2)  →  8x8 Hermitian
+Observable 2: qubits (0, 1, 3)  →  8x8 Hermitian
+Observable 3: qubits (0, 2, 3)  →  8x8 Hermitian
+Observable 4: qubits (1, 2, 3)  →  8x8 Hermitian
+```
+
+Each 8x8 Hermitian has 64 free parameters (28 off-diagonal real + 28 off-diagonal imaginary + 8 diagonal).
+
+- **Total ANO parameters**: 4 observables x 64 params = **256 parameters**
+- **Correlation order**: Captures up to **3-body correlations** -- how triples of qubits are simultaneously correlated
+- **Middle ground**: 2.7x more parameters than k=2 but 6x fewer than global k=4. Captures most multi-body correlations while remaining computationally efficient.
+- **Note**: Fewer wire groups (4 vs 6 for k=2) but each Hermitian is 4x larger, yielding a net increase in expressivity.
+
 ### Global ANO (k=4)
 
-Global ANO measures the **full 4-qubit system** with each observable. All 6 observables act on all 4 qubits simultaneously:
+Global ANO measures the **full 4-qubit system** with each observable. All observables act on all 4 qubits simultaneously:
 
 ```
 Observable 1: qubits (0, 1, 2, 3)  →  16x16 Hermitian
@@ -188,32 +206,32 @@ Each 16x16 Hermitian has 256 free parameters (120 off-diagonal real + 120 off-di
 
 - **Total ANO parameters**: 6 observables x 256 params = **1,536 parameters**
 - **Correlation order**: Captures **all 1-through-4-body correlations** -- every possible entanglement pattern in the 4-qubit system
-- **Strictly more expressive**: Any pairwise observable can be embedded in a global observable (by zeroing out higher-order terms), but not vice versa
+- **Strictly more expressive**: Any k=2 or k=3 observable can be embedded in a global observable (by zeroing out higher-order terms), but not vice versa
 
 ### Comparison
 
-| Aspect | Pairwise (k=2) | Global (k=4) |
-|--------|----------------|--------------|
-| Wire groups | C(4,2) = 6 pairs | 6 copies of all 4 qubits |
-| Hermitian size | 4x4 | 16x16 |
-| Params per observable | 16 | 256 |
-| Total ANO params | 96 | 1,536 |
-| Max correlation order | 2-body | 4-body (all) |
-| Expressivity | Limited to pairwise | Full Hilbert space |
-| Training cost | Lower (fewer params) | Higher (16x more params) |
+| Aspect | Pairwise (k=2) | Triple (k=3) | Global (k=4) |
+|--------|----------------|--------------|--------------|
+| Wire groups | C(4,2) = 6 pairs | C(4,3) = 4 triples | 6 copies of all 4 qubits |
+| Hermitian size | 4x4 | 8x8 | 16x16 |
+| Params per observable | 16 | 64 | 256 |
+| Total ANO params | 96 | 256 | 1,536 |
+| Max correlation order | 2-body | 3-body | 4-body (all) |
+| Expressivity | Pairwise only | Most multi-body | Full Hilbert space |
+| Training cost | Lowest | Moderate | Highest (16x vs k=2) |
 
-## v10 Configurations (v10a--v10d)
+## v10 Configurations (v10a--v10f)
 
-The four v10 variants explore two independent design axes in a 2x2 grid:
+The six v10 variants explore two independent design axes in a 2x3 grid:
 
-|                  | Pairwise ANO (k=2)  | Global ANO (k=4)    |
-|------------------|----------------------|----------------------|
-| **Concat time**  | **v10a**             | **v10c**             |
-| **Additive time**| **v10b**             | **v10d**             |
+|                  | Pairwise ANO (k=2)  | Triple ANO (k=3)    | Global ANO (k=4)    |
+|------------------|----------------------|----------------------|----------------------|
+| **Concat time**  | **v10a**             | **v10e**             | **v10c**             |
+| **Additive time**| **v10b**             | **v10f**             | **v10d**             |
 
 ### Time Conditioning: Concat vs Additive
 
-**Concat** (v10a, v10c): The noisy latent code z_t and time embedding t_emb are concatenated before encoding:
+**Concat** (v10a, v10c, v10e): The noisy latent code z_t and time embedding t_emb are concatenated before encoding:
 
 ```
 z_combined = [z_t, t_emb]    # dim = latent_dim + time_embed_dim
@@ -223,7 +241,7 @@ For latent_dim=256 with time_embed_dim=256: input_dim = 512, projected to 255 SU
 
 For latent_dim=128 with time_embed_dim=128: input_dim = 256, projected to 255 SU(16) params (1.00:1 ratio).
 
-**Additive** (v10b, v10d): The time embedding is projected to the same dimension as z_t and added:
+**Additive** (v10b, v10d, v10f): The time embedding is projected to the same dimension as z_t and added:
 
 ```
 t_proj = time_mlp(t_emb)     # dim = latent_dim
@@ -240,35 +258,47 @@ The enc_proj ratio measures how much information compression or expansion occurs
 
 | Config | Latent | Time Cond. | Input Dim | SU(16) Params | Ratio |
 |--------|--------|------------|-----------|---------------|-------|
-| v10a   | 128    | concat     | 256       | 255           | 1.00:1 |
-| v10a   | 256    | concat     | 512       | 255           | 2.01:1 |
-| v10a   | 512    | concat     | 1024      | 255           | 4.02:1 |
-| v10b   | 128    | additive   | 128       | 255           | 0.50:1 |
-| v10b   | 256    | additive   | 256       | 255           | 1.00:1 |
-| v10b   | 512    | additive   | 512       | 255           | 2.01:1 |
+| v10a/e | 128    | concat     | 256       | 255           | 1.00:1 |
+| v10a/e | 256    | concat     | 512       | 255           | 2.01:1 |
+| v10a/e | 512    | concat     | 1024      | 255           | 4.02:1 |
+| v10b/f | 128    | additive   | 128       | 255           | 0.50:1 |
+| v10b/f | 256    | additive   | 256       | 255           | 1.00:1 |
+| v10b/f | 512    | additive   | 512       | 255           | 2.01:1 |
 
 The same ratios apply to v10c/v10d (which share time conditioning with v10a/v10b respectively).
 
 ### Configuration Details
 
-**v10a -- Concat + Pairwise ANO:**
+**v10a -- Concat + Pairwise ANO (k=2):**
 - Time: z_combined = [z_t, t_emb]
 - ANO: 6 pairwise 4x4 Hermitians (96 params)
 - Best enc_proj ratio at latent_dim=128 (1.00:1)
 
-**v10b -- Additive + Pairwise ANO:**
+**v10b -- Additive + Pairwise ANO (k=2):**
 - Time: z_combined = z_t + time_mlp(t)
 - ANO: 6 pairwise 4x4 Hermitians (96 params)
 - Best enc_proj ratio at latent_dim=256 (1.00:1)
 
-**v10c -- Concat + Global ANO:**
+**v10c -- Concat + Global ANO (k=4):**
 - Time: z_combined = [z_t, t_emb]
 - ANO: 6 global 16x16 Hermitians (1,536 params)
 - Best enc_proj ratio at latent_dim=128 (1.00:1)
 
-**v10d -- Additive + Global ANO:**
+**v10d -- Additive + Global ANO (k=4):**
 - Time: z_combined = z_t + time_mlp(t)
 - ANO: 6 global 16x16 Hermitians (1,536 params)
+- Best enc_proj ratio at latent_dim=256 (1.00:1)
+
+**v10e -- Concat + Triple ANO (k=3):**
+- Time: z_combined = [z_t, t_emb]
+- ANO: 4 triple 8x8 Hermitians (256 params)
+- Captures up to 3-body correlations
+- Best enc_proj ratio at latent_dim=128 (1.00:1)
+
+**v10f -- Additive + Triple ANO (k=3):**
+- Time: z_combined = z_t + time_mlp(t)
+- ANO: 4 triple 8x8 Hermitians (256 params)
+- Captures up to 3-body correlations
 - Best enc_proj ratio at latent_dim=256 (1.00:1)
 
 ## Training Details
